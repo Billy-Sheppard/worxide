@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <link rel="icon" type="image/x-icon" href="worxide.png">
+
+  <title>worxide</title>
+
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bulma@1.0.4/css/bulma.min.css">
+
+  <style>
+    html,
+    body {
+      width: 100svw;
+      height: 100svh;
+      overflow: hidden;
+      margin: 0;
+    }
+
+    .fading-text {
+      animation: fade 0.75s infinite alternate;
+    }
+
+    @keyframes fade {
+      from {
+        color: #fff;
+      }
+
+      to {
+        color: #808080;
+      }
+    }
+  </style>
+
+  <script>
+    (async () => {
+      if (self.crossOriginIsolated) return;
+      if (!('serviceWorker' in navigator)) return;
+      await navigator.serviceWorker.register('./sw.js', { scope: './' });
+      await navigator.serviceWorker.ready;
+      location.reload();
+    })();
+  </script>
+</head>
+
+<body></body>
+
+<script type="module">
+  import init, { run_app } from './worxide_example.js';
+  if (self.crossOriginIsolated) {
+    await init();
+    await run_app();
+  }
+</script>
+
+</html>

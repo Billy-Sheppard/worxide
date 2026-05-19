@@ -1,0 +1,84 @@
+//! worxide — spawn Rust functions on Web Workers via shared memory.
+//!
+//! worxide runs a Rust function on a Web Worker and awaits its result, while
+//! the calling thread stays free. The whole API is two macros:
+//!
+//! ```ignore
+//! // A synchronous (CPU-bound) function:
+//! fn crunch(n: u32) -> u64 { /* ... */ }
+//! let result = worxide::spawn_blocking!(crunch, 42).await?;
+//!
+//! // An async function:
+//! async fn fetch_and_crunch(n: u32) -> u64 { /* ... */ }
+//! let result = worxide::spawn!(fetch_and_crunch, 42).await?;
+//! ```
+//!
+//! Both return `anyhow::Result<R>`, where `R` is the function's return type
+//! (inferred — no turbofish needed). See the crate README for the required
+//! build flags and cross-origin-isolation setup.
+
+#[doc(hidden)]
+pub mod private;
+
+/// Returns `true` if the current thread is a Web Worker, `false` if it is the
+/// main (window) thread.
+///
+/// This is useful for guarding main-thread-only work (DOM access, UI setup),
+/// since the wasm module is instantiated on every worker too. Prefer this over
+/// ad-hoc checks like `web_sys::window().is_none()`: it positively identifies a
+/// worker by testing the global scope against `WorkerGlobalScope`, rather than
+/// inferring "worker" from the absence of a window.
+///
+/// ```ignore
+/// #[wasm_bindgen]
+/// pub fn run() {
+///     if worxide::is_worker() { return; } // never build UI on a worker
+///     // ... main-thread setup ...
+/// }
+/// ```
+pub fn is_worker() -> bool {
+    use wasm_bindgen::{JsCast, JsValue};
+    let global: JsValue = js_sys::global().into();
+    // `WorkerGlobalScope` exists only inside workers. If the global is an
+    // instance of it, we're on a worker thread.
+    global.is_instance_of::<web_sys::WorkerGlobalScope>()
+}
+
+/// Spawn a synchronous function on a Web Worker and await its result.
+///
+/// The worker runs `func(args...)` on its own thread; the call site gets back
+/// a future of `anyhow::Result<R>`, with `R` inferred from `func`'s return
+/// type. Use this for CPU-bound work that would otherwise block the caller.
+///
+/// ```ignore
+/// fn crunch(n: u32) -> u64 { (n as u64) * 2 }
+/// let result = worxide::spawn_blocking!(crunch, 42).await?;
+/// ```
+#[macro_export]
+macro_rules! spawn_blocking {
+    ($func:path $(, $arg:expr)* $(,)?) => {{
+        $crate::private::run_blocking(
+            move || $func($($arg),*),
+            env!("CARGO_PKG_NAME"),
+        )
+    }};
+}
+
+/// Spawn an asynchronous function on a Web Worker and await its result.
+///
+/// Like [`spawn_blocking!`], but for `async fn` / future-returning functions.
+/// The worker drives the future to completion on its own event loop.
+///
+/// ```ignore
+/// async fn crunch(n: u32) -> u64 { (n as u64) * 2 }
+/// let result = worxide::spawn!(crunch, 42).await?;
+/// ```
+#[macro_export]
+macro_rules! spawn {
+    ($func:path $(, $arg:expr)* $(,)?) => {{
+        $crate::private::run_async(
+            move || async move { $func($($arg),*).await },
+            env!("CARGO_PKG_NAME"),
+        )
+    }};
+}

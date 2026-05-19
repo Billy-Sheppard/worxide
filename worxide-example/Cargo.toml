@@ -1,0 +1,45 @@
+[package]
+name = "worxide-example"
+version = "0.0.2"
+edition = "2024"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+anyhow = { workspace = true }
+dominator = "0.5.38"
+futures-signals = "0.3.34"
+gloo = "0.12.0"
+js-sys = { workspace = true }
+# serde = "1.0.228"
+serde_json = "1.0.150"
+reqwest = { version = "0.13.4", features = ["json"] }
+wasm-bindgen = { workspace = true }
+wasm-bindgen-futures = { workspace = true }
+web-sys = { workspace = true, features = [
+    "console",
+    "HtmlAnchorElement",
+    "HtmlButtonElement",
+    "HtmlCanvasElement",
+    "HtmlDetailsElement",
+    "HtmlDivElement",
+    "HtmlEmbedElement",
+    "HtmlFormElement",
+    "HtmlHeadingElement",
+    "HtmlIFrameElement",
+    "HtmlImageElement",
+    "HtmlObjectElement",
+    "HtmlOptionElement",
+    "HtmlParagraphElement",
+    "HtmlProgressElement",
+    "HtmlSelectElement",
+    "HtmlSpanElement",
+    "HtmlTableCellElement",
+    "HtmlTableElement",
+    "HtmlTableRowElement",
+    "HtmlTableSectionElement",
+    "Performance",
+    "Window",
+] }
+worxide = { path = "../" }
