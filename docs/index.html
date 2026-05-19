@@ -1,0 +1,26 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>worxide</title>
+  <script>
+    (async () => {
+      if (self.crossOriginIsolated) return;
+      if (!('serviceWorker' in navigator)) return;
+      await navigator.serviceWorker.register('./sw.js', { scope: './' });
+      await navigator.serviceWorker.ready;
+      location.reload();
+    })();
+  </script>
+</head>
+<body>
+<script type="module">
+  import init, { run } from './worxide_example.js';
+  if (self.crossOriginIsolated) {
+    await init();
+    run();
+  }
+</script>
+</body>
+</html>

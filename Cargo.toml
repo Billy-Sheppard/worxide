@@ -1,0 +1,27 @@
+[workspace]
+resolver = "3"
+members = ["worxide-example"]
+
+[workspace.dependencies]
+anyhow = "1.0.102"
+js-sys = "0.3.99"
+wasm-bindgen = "0.2.122"
+wasm-bindgen-futures = "0.4.72"
+web-sys = { version = "0.3.99", features = [ "Blob", "BlobPropertyBag", "MessageEvent", "Url", "Worker", "WorkerGlobalScope", "WorkerOptions", "WorkerType"
+] }
+
+[package]
+name = "worxide"
+version = "0.0.1"
+edition = "2024"
+
+[dependencies]
+anyhow = { workspace = true }
+js-sys = { workspace = true }
+wasm-bindgen = { workspace = true }
+wasm-bindgen-futures = { workspace = true }
+web-sys = { workspace = true }
+
+[profile.release]
+opt-level = 3
+lto = true
