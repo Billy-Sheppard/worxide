@@ -14,13 +14,9 @@
 </body>
 
 <script type="module">
-    import init from "./worxide.js";
-
-    async function run() {
-        await init();
-    }
-
-    run();
+    import init from './worxide.js';
+    window.__wasm_glue_url = new URL('./worxide.js', import.meta.url).href;
+    await init();
 </script>
-<script src="sw.js"></script>
+
 </html>

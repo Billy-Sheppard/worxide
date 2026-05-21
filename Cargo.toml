@@ -1,3 +1,7 @@
+[workspace]
+members = [".", "macros"]
+resolver = "2"
+
 [package]
 name = "worxide"
 version = "0.1.0"
@@ -7,9 +11,8 @@ edition = "2024"
 crate-type = ["cdylib"]
 
 [dependencies]
-anyhow = "1.0.102"
+worxide-macros = { path = "./macros" }
 js-sys = "0.3.98"
-linkme = "0.3.36"
 serde = "1.0.228"
 serde_json = "1.0.149"
 wasm-bindgen = "0.2.121"
@@ -27,14 +30,29 @@ web-sys = { version = "0.3.98", features = [
 ] }
 
 console_error_panic_hook = { optional = true, version = "0.1.7" }
-gloo = { optional = true, version = "0.12.0" }
+gloo = { optional = true, version = "0.12.0", features = [ "futures" ] }
 getrandom = { optional = true, version = "0.4.2", default-features = false, features = [
     "wasm_js",
 ] }
 rand = { optional = true, version = "0.10.1", default-features = false, features = [
     "thread_rng",
 ] }
+dominator = { optional = true, version = "0.5" }
+futures-signals = { optional = true, version = "0.3" }
+futures = { optional = true, version = "0.3" }
+once_cell = { optional = true, version = "1" }
 
 [features]
 default = []
-example = ["console_error_panic_hook", "gloo", "getrandom", "rand"]
+example = [
+    "console_error_panic_hook",
+    "dominator",
+    "futures-signals",
+    "futures",
+    "getrandom",
+    "gloo",
+    "once_cell",
+    "rand",
+    "web-sys/Performance",
+    "web-sys/Window",
+]
