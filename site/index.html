@@ -1,22 +1,44 @@
 <!DOCTYPE html>
 <html lang="en">
-
 <head>
-    <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-
-    <title>Worxide Test</title>
-
-    <link rel="stylesheet" href="./index.css" />
+  <meta charset="UTF-8" />
+  <title>worxide</title>
+  <script>
+    (async () => {
+      if (!('serviceWorker' in navigator)) return;
+      if (typeof SharedArrayBuffer !== 'undefined') return;
+      const sw = `
+self.addEventListener('install',  () => self.skipWaiting());
+self.addEventListener('activate', e => e.waitUntil(self.clients.claim()));
+self.addEventListener('fetch', e => {
+  e.respondWith(fetch(e.request).then(r => {
+    if (!r.url.startsWith(self.location.origin)) return r;
+    const h = new Headers(r.headers);
+    h.set('Cross-Origin-Opener-Policy',  'same-origin');
+    h.set('Cross-Origin-Embedder-Policy','require-corp');
+    return new Response(r.body, { status: r.status, statusText: r.statusText, headers: h });
+  }));
+});`;
+      const url = URL.createObjectURL(new Blob([sw], { type: 'application/javascript' }));
+      await navigator.serviceWorker.register(url, { scope: './' });
+      await navigator.serviceWorker.ready;
+      location.reload();
+    })();
+  </script>
 </head>
-
 <body>
-</body>
-
 <script type="module">
-    import init from './worxide.js';
-    window.__wasm_glue_url = new URL('./worxide.js', import.meta.url).href;
-    await init();
-</script>
+  import init, { set_wasm_handles, run } from './worxide.js';
+  import { __wbg_shared_memory as memory } from './worxide.js';
 
+  const module = await WebAssembly.compileStreaming(fetch('./worxide_bg.wasm'));
+  await init({ module_or_path: module });
+
+  const glue_url   = new URL('./worxide.js', import.meta.url).href;
+  const worker_url = new URL('./worker.js',  import.meta.url).href;
+
+  set_wasm_handles(module, memory, worker_url, glue_url);
+  run();
+</script>
+</body>
 </html>

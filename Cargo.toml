@@ -1,58 +1,25 @@
-[workspace]
-members = [".", "macros"]
-resolver = "2"
-
 [package]
 name = "worxide"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
 
 [lib]
 crate-type = ["cdylib"]
 
 [dependencies]
-worxide-macros = { path = "./macros" }
-js-sys = "0.3.98"
-serde = "1.0.228"
-serde_json = "1.0.149"
-wasm-bindgen = "0.2.121"
-wasm-bindgen-futures = "0.4.71"
-web-sys = { version = "0.3.98", features = [
-    "Blob",
-    "BlobPropertyBag",
-    "DedicatedWorkerGlobalScope",
-    "MessageEvent",
-    "Url",
+wasm-bindgen = "0.2"
+js-sys        = "0.3"
+web-sys = { version = "0.3", features = [
+    "console",
     "Worker",
-    "WorkerGlobalScope",
     "WorkerOptions",
     "WorkerType",
+    "Blob",
+    "BlobPropertyBag",
+    "Url",
 ] }
+tokio = { version = "1", features = ["sync"], default-features = false }
 
-console_error_panic_hook = { optional = true, version = "0.1.7" }
-gloo = { optional = true, version = "0.12.0", features = [ "futures" ] }
-getrandom = { optional = true, version = "0.4.2", default-features = false, features = [
-    "wasm_js",
-] }
-rand = { optional = true, version = "0.10.1", default-features = false, features = [
-    "thread_rng",
-] }
-dominator = { optional = true, version = "0.5" }
-futures-signals = { optional = true, version = "0.3" }
-futures = { optional = true, version = "0.3" }
-once_cell = { optional = true, version = "1" }
-
-[features]
-default = []
-example = [
-    "console_error_panic_hook",
-    "dominator",
-    "futures-signals",
-    "futures",
-    "getrandom",
-    "gloo",
-    "once_cell",
-    "rand",
-    "web-sys/Performance",
-    "web-sys/Window",
-]
+[profile.release]
+opt-level = 3
+lto       = true
