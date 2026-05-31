@@ -353,14 +353,33 @@ impl JobState {
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
-fn random_word() -> String {
-    const WORDS: &[&str] = &[
-        "falcon", "ember", "quartz", "willow", "cobalt", "nimbus", "thistle", "harbor", "vortex",
-        "cedar", "marble", "zephyr", "lumen", "onyx", "saffron", "drift", "pinecone", "basalt",
-        "comet", "tundra",
-    ];
-    let idx = (js_sys::Math::random() * WORDS.len() as f64) as usize;
-    WORDS[idx.min(WORDS.len() - 1)].to_owned()
+const WORDS: &[&str] = &[
+    "falcon", "ember", "quartz", "willow", "cobalt", "nimbus", "thistle", "harbor", "vortex",
+    "cedar", "marble", "zephyr", "lumen", "onyx", "saffron", "drift", "pinecone", "basalt",
+    "comet", "tundra", "cinder", "harlow", "juniper", "kestrel", "lichen", "opal", "rowan",
+    "sable", "umber", "verdant", "wren", "yarrow", "azure", "flint",
+];
+
+/// Deal `n` distinct labels. Shuffles WORDS (Fisher-Yates) and takes the
+/// first `n`; if `n` exceeds the pool, wraps with numeric suffixes so labels
+/// stay unique even when oversubscribing more workers than words.
+fn unique_labels(n: usize) -> Vec<String> {
+    let mut pool: Vec<&str> = WORDS.to_vec();
+    let len = pool.len();
+    for i in (1..len).rev() {
+        let j = (js_sys::Math::random() * (i as f64 + 1.0)) as usize;
+        pool.swap(i, j.min(i));
+    }
+    (0..n)
+        .map(|i| {
+            let word = pool[i % len];
+            if i < len {
+                word.to_owned()
+            } else {
+                format!("{word}-{}", i / len + 1)
+            }
+        })
+        .collect()
 }
 
 /// Current high-resolution time in ms. Works on the main thread (Window) AND
@@ -399,7 +418,7 @@ async fn yield_to_event_loop() {
 
 type FrameCb = Rc<RefCell<Option<Closure<dyn FnMut()>>>>;
 
-fn start_frame_meter(frame_ms: Mutable<f64>) {
+fn start_frame_meter(frame_ms: Mutable<f64>, done: Mutable<bool>) {
     let last = Rc::new(RefCell::new(now_ms()));
     let cb: FrameCb = Rc::new(RefCell::new(None));
     let cb2 = cb.clone();
@@ -409,6 +428,11 @@ fn start_frame_meter(frame_ms: Mutable<f64>) {
         *last.borrow_mut() = t;
         let prev = frame_ms.get();
         frame_ms.set(prev * 0.8 + dt * 0.2);
+        // Once every job is finished, stop the rAF loop — the readout freezes
+        // at its last value rather than continuing to sample an idle page.
+        if done.get() {
+            return;
+        }
         if let Some(w) = web_sys::window()
             && let Some(c) = cb2.borrow().as_ref()
         {
@@ -424,19 +448,40 @@ fn start_frame_meter(frame_ms: Mutable<f64>) {
 
 // ── Compute Pressure API (real CPU pressure where supported) ─────────────────
 
-fn start_pressure_observer(state: Mutable<Option<String>>) {
+/// Map a Compute Pressure state string to a 0–3 severity level.
+fn pressure_level(s: &str) -> u8 {
+    match s {
+        "nominal" => 0,
+        "fair" => 1,
+        "serious" => 2,
+        "critical" => 3,
+        _ => 0,
+    }
+}
+
+fn start_pressure_observer(state: Mutable<Option<String>>, history: MutableVec<u8>) {
     let global = js_sys::global();
     let ctor = match js_sys::Reflect::get(&global, &JsValue::from_str("PressureObserver")) {
         Ok(v) if !v.is_undefined() => v,
         _ => return,
     };
-    let cb = Closure::wrap(Box::new(clone!(state => move |records: JsValue| {
+    let cb = Closure::wrap(Box::new(clone!(state, history => move |records: JsValue| {
         if let Ok(arr) = records.dyn_into::<js_sys::Array>() {
             let len = arr.length();
             if len > 0
                 && let Ok(s) = js_sys::Reflect::get(&arr.get(len - 1), &JsValue::from_str("state"))
                 && let Some(s) = s.as_string()
             {
+                // Record every sample in the history (for the sparkline), and
+                // cap the buffer so it scrolls rather than growing forever.
+                let lvl = pressure_level(&s);
+                {
+                    let mut h = history.lock_mut();
+                    h.push_cloned(lvl);
+                    while h.len() > PRESSURE_HISTORY_LEN {
+                        h.remove(0);
+                    }
+                }
                 state.set(Some(s));
             }
         }
@@ -457,14 +502,17 @@ fn start_pressure_observer(state: Mutable<Option<String>>) {
         && let Ok(observe_fn) = observe.dyn_into::<js_sys::Function>()
     {
         let opts = js_sys::Object::new();
+        // Sample frequently so brief spikes show up in the sparkline.
         let _ = js_sys::Reflect::set(
             &opts,
             &JsValue::from_str("sampleInterval"),
-            &JsValue::from_f64(1000.0),
+            &JsValue::from_f64(250.0),
         );
         let _ = observe_fn.call2(&observer, &JsValue::from_str("cpu"), &opts);
     }
 }
+
+const PRESSURE_HISTORY_LEN: usize = 48;
 
 // ── Styles (all defined in Rust via dominator) ───────────────────────────────
 
@@ -738,6 +786,44 @@ fn bar_fill() -> String {
     })
 }
 
+/// Sparkline container: a fixed-height row of bars, newest on the right.
+fn spark() -> String {
+    thread_local! { static C: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) }; }
+    C.with(|c| {
+        if let Some(s) = c.borrow().as_ref() {
+            return s.clone();
+        }
+        let s = class! {
+            .style("display", "flex")
+            .style("align-items", "flex-end")
+            .style("gap", "2px")
+            .style("height", "24px")
+            .style("margin-top", "8px")
+            .style("width", "100%")
+        };
+        *c.borrow_mut() = Some(s.clone());
+        s
+    })
+}
+
+/// One sparkline bar. Height + background are set inline per sample.
+fn spark_bar() -> String {
+    thread_local! { static C: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) }; }
+    C.with(|c| {
+        if let Some(s) = c.borrow().as_ref() {
+            return s.clone();
+        }
+        let s = class! {
+            .style("flex", "1 1 0")
+            .style("min-width", "2px")
+            .style("border-radius", "1px")
+            .style("transition", "height 0.2s ease, background 0.2s ease")
+        };
+        *c.borrow_mut() = Some(s.clone());
+        s
+    })
+}
+
 fn grid() -> String {
     thread_local! { static C: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) }; }
     C.with(|c| {
@@ -946,6 +1032,22 @@ fn badge() -> String {
 
 // ── UI rendering ─────────────────────────────────────────────────────────────
 
+/// One bar of the pressure sparkline. Height and color scale with severity
+/// level (0 nominal … 3 critical).
+fn render_spark_bar(level: u8) -> Dom {
+    let (height_pct, color) = match level {
+        0 => (18, "#2c3a2c"),  // nominal — low, muted green-grey
+        1 => (45, "#9ece6a"),  // fair — green
+        2 => (72, "#e0af68"),  // serious — amber
+        _ => (100, "#f7768e"), // critical — red
+    };
+    html!("div", {
+        .class(&spark_bar())
+        .style("height", &format!("{height_pct}%"))
+        .style("background", color)
+    })
+}
+
 fn render_job(job: Arc<JobState>) -> Dom {
     html!("div", {
         .class(&card())
@@ -1031,6 +1133,7 @@ fn render_app(
     jobs: MutableVec<Arc<JobState>>,
     frame_ms: Mutable<f64>,
     pressure: Mutable<Option<String>>,
+    pressure_history: MutableVec<u8>,
     done_count: Mutable<usize>,
     total: usize,
 ) -> Dom {
@@ -1098,6 +1201,15 @@ fn render_app(
                                         .text_signal(pressure.signal_cloned()
                                             .map(|p| p.unwrap_or_else(|| "—".to_owned())))
                                     }),
+                                    // Historical sparkline: one bar per sample,
+                                    // height + color scaled by severity. Brief
+                                    // spikes stay visible as they scroll left.
+                                    html!("div", {
+                                        .class(&spark())
+                                        .children_signal_vec(
+                                            pressure_history.signal_vec_cloned().map(render_spark_bar)
+                                        )
+                                    }),
                                 ])
                             }),
                         ])
@@ -1138,10 +1250,12 @@ pub fn run() {
     let jobs: MutableVec<Arc<JobState>> = MutableVec::new();
     let frame_ms = Mutable::new(16.7);
     let pressure: Mutable<Option<String>> = Mutable::new(None);
+    let pressure_history: MutableVec<u8> = MutableVec::new();
     let done_count = Mutable::new(0usize);
+    let all_done_flag = Mutable::new(false);
 
-    start_frame_meter(frame_ms.clone());
-    start_pressure_observer(pressure.clone());
+    start_frame_meter(frame_ms.clone(), all_done_flag.clone());
+    start_pressure_observer(pressure.clone(), pressure_history.clone());
 
     // Kick off a varied set of CPU-heavy jobs concurrently, each on its own
     // worker. Inputs are tuned HEAVY — each task should grind for several
@@ -1162,6 +1276,16 @@ pub fn run() {
         Task::Collatz(12_000_000),
     ];
     let total = tasks.len();
+    let labels = unique_labels(total);
+
+    // Flip the all-done flag once every job reports complete. This freezes the
+    // frame meter and triggers the header checkmark.
+    wasm_bindgen_futures::spawn_local(clone!(done_count, all_done_flag => async move {
+        done_count.signal().for_each(move |d| {
+            if d >= total { all_done_flag.set(true); }
+            async {}
+        }).await;
+    }));
 
     dominator::append_dom(
         &dominator::body(),
@@ -1169,13 +1293,14 @@ pub fn run() {
             jobs.clone(),
             frame_ms.clone(),
             pressure.clone(),
+            pressure_history.clone(),
             done_count.clone(),
             total,
         ),
     );
 
-    for &task in tasks.iter() {
-        let job = JobState::new(random_word(), task);
+    for (&task, label) in tasks.iter().zip(labels) {
+        let job = JobState::new(label, task);
         jobs.lock_mut().push_cloned(job.clone());
 
         wasm_bindgen_futures::spawn_local(clone!(job, done_count => async move {

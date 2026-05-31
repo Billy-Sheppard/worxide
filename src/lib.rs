@@ -8,8 +8,11 @@ use wasm_bindgen::prelude::*;
 pub mod __private {
     use anyhow::{anyhow, Context, Result};
     use js_sys::{Promise, Reflect};
+    use std::cell::RefCell;
     use std::future::Future;
     use std::pin::Pin;
+    use std::rc::Rc;
+    use std::task::{Poll, RawWaker, RawWakerVTable, Waker};
     use wasm_bindgen::closure::Closure;
     use wasm_bindgen::prelude::*;
     use wasm_bindgen_futures::JsFuture;
@@ -123,20 +126,19 @@ pub mod __private {
         anyhow!("{context}: {stringified}")
     }
 
-    static mut GLUE_URL: Option<String> = None;
+    thread_local! {
+        /// Cached glue-file URL, computed once on first spawn. Lives in
+        /// thread-local storage on the main thread (the only place spawns
+        /// originate), so no `unsafe` or `static mut` is needed.
+        static GLUE_URL: RefCell<Option<String>> = const { RefCell::new(None) };
+    }
 
-    fn cached_glue_url(crate_name: &str) -> &'static str {
-        // SAFETY: single-threaded main wasm thread, never mutated after init.
-        // We DO NOT use ptr::read here — for a non-Copy type like Option<String>
-        // that would clone the bookkeeping then drop it, freeing the heap buffer
-        // out from under us. Instead we read via a const-pointer dereference,
-        // which gives us a reference without moving.
-        unsafe {
-            if (*std::ptr::addr_of!(GLUE_URL)).is_none() {
-                GLUE_URL = Some(worxide_glue_url(crate_name));
-            }
-            (*std::ptr::addr_of!(GLUE_URL)).as_deref().unwrap()
-        }
+    fn cached_glue_url(crate_name: &str) -> String {
+        GLUE_URL.with(|cell| {
+            cell.borrow_mut()
+                .get_or_insert_with(|| worxide_glue_url(crate_name))
+                .clone()
+        })
     }
 
     fn worker_url() -> Result<String> {
@@ -154,7 +156,7 @@ pub mod __private {
     /// Spawn a worker, post the task pointer, await the reply.
     /// `kind` is "sync" or "async" — tells worker.js which entry to call.
     async fn run_inner(task_ptr: usize, kind: &str, crate_name: &str) -> Result<usize> {
-        let glue_url = cached_glue_url(crate_name).to_owned();
+        let glue_url = cached_glue_url(crate_name);
         let worker_url = worker_url()?;
         let module = wasm_bindgen::module();
         let memory = wasm_bindgen::memory();
@@ -263,10 +265,6 @@ pub mod __private {
     // Promise.then wakeups also land on this event loop, so we make progress
     // with no cross-thread machinery.
 
-    use std::cell::RefCell;
-    use std::rc::Rc;
-    use std::task::{Poll, RawWaker, RawWakerVTable, Waker};
-
     type SharedFut = Rc<RefCell<Pin<Box<dyn Future<Output = *mut ()>>>>>;
 
     struct DriveState {
@@ -302,7 +300,7 @@ pub mod __private {
             }
             *self.scheduled.borrow_mut() = true;
             let this = self.clone();
-            let cb = wasm_bindgen::closure::Closure::once_into_js(move || this.poll());
+            let cb = Closure::once_into_js(move || this.poll());
             queue_microtask(&cb);
         }
 
