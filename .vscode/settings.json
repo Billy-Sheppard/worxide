@@ -1,5 +1,3 @@
 {
-    "rust-analyzer.cargo.features": [
-        "example"
-    ]
+    "rust-analyzer.cargo.features": []
 }
