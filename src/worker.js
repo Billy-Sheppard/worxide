@@ -1,35 +1,37 @@
 // worxide worker bootstrap.
-// Embedded into the Rust crate via include_str! and served at runtime from a
-// Blob URL. Receives the wasm module, shared memory, task ptr, kind, and glue
-// URL from the main thread.
 //
-// With wasm-bindgen's threading transform (enabled by the rayon-style build
-// flags: imported shared memory + exported __wasm_init_tls / __tls_* /
-// __heap_base), initSync({ module, memory }) attaches this worker to the
-// shared memory AND performs correct per-thread initialization, allocating
-// this thread's own TLS block via the wasm's exported __wasm_init_tls. We no
-// longer manage TLS, memory interception, or __wbindgen_start ordering by hand.
+// Embedded into the crate via include_str! and served from a Blob URL at
+// runtime. This code necessarily lives in JavaScript: it runs *before* the
+// wasm module is initialized on this thread, and its whole job is to bootstrap
+// wasm into existence — you can't write that in the thing it's booting.
+// (For comparison, wasm-bindgen-rayon and the official wasm-bindgen threading
+// examples likewise keep their worker bootstrap + dispatch in JS.)
+//
+// The build flags (imported shared memory + exported __wasm_init_tls / __tls_*
+// / __heap_base) let wasm-bindgen's threading transform handle per-thread
+// initialization: initSync({ module, memory }) attaches this worker to the
+// shared memory and allocates this thread's own TLS block. We don't manage
+// TLS, memory, or __wbindgen_start ordering by hand.
+//
+// `glue_url` is resolved at runtime (the consumer's crate name isn't known at
+// build time) and passed in via postMessage from the main thread.
 
-self.addEventListener('error', e => console.error('[worxide:worker]', e.message, e));
-self.addEventListener('unhandledrejection', e => console.error('[worxide:worker] rejection:', e.reason));
+// Surface worker-side errors in the page console for diagnostics. Async
+// rejections reach the unhandledrejection listener on their own.
+self.addEventListener('error', e => console.error('[worxide:worker]', e.message));
+self.addEventListener('unhandledrejection', e => console.error('[worxide:worker]', e.reason));
 
 self.onmessage = async ({ data: { kind, module, memory, ptr, glue_url } }) => {
-    try {
-        const glue = await import(glue_url);
+    const glue = await import(glue_url);
 
-        // Attach to the main thread's shared memory and initialize this
-        // worker thread. wasm-bindgen's generated initSync handles TLS
-        // allocation and per-thread __wbindgen_start for this instance.
-        glue.initSync({ module, memory });
+    // Attach to the main thread's shared memory and initialize this worker
+    // thread. wasm-bindgen's generated initSync handles TLS allocation and
+    // per-thread __wbindgen_start for this instance.
+    glue.initSync({ module, memory });
 
-        let result_ptr;
-        if (kind === 'sync') {
-            result_ptr = glue.__worxide_worker_entry(ptr);
-        } else {
-            result_ptr = await glue.__worxide_worker_entry_async(ptr);
-        }
-        self.postMessage(result_ptr);
-    } catch (e) {
-        throw e;
-    }
+    const result_ptr = kind === 'sync'
+        ? glue.__worxide_worker_entry(ptr)
+        : await glue.__worxide_worker_entry_async(ptr);
+
+    self.postMessage(result_ptr);
 };

@@ -13,7 +13,6 @@ rustflags = [
     "-C", "link-arg=--export=__tls_base",
     "-C", "link-arg=--export=__heap_base",
     "-C", "link-arg=--export=__data_end",
-    "--cfg", "getrandom_backend=\"wasm_js\"",
 ]
 
 [unstable]

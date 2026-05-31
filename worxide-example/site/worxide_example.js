@@ -1,5 +1,5 @@
-import { worxide_glue_url } from './snippets/worxide-b41acc353c4bdba2/inline1.js';
-import * as import1 from "./snippets/worxide-b41acc353c4bdba2/inline0.js"
+import { worxide_glue_url } from './snippets/worxide-983f3759d96de773/inline1.js';
+import * as import1 from "./snippets/worxide-983f3759d96de773/inline0.js"
 
 
 /**
@@ -438,7 +438,7 @@ function __wbg_get_imports(memory) {
             const ret = Atomics.waitAsync;
             return ret;
         },
-        __wbg_worxide_glue_url_9e4d5679748dd5e6: function(arg0, arg1, arg2) {
+        __wbg_worxide_glue_url_b29e9f74d8b16db9: function(arg0, arg1, arg2) {
             var v0 = getCachedStringFromWasm0(arg1, arg2);
             const ret = worxide_glue_url(v0);
             const ptr2 = passStringToWasm0(ret, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
@@ -505,7 +505,7 @@ function __wbg_get_imports(memory) {
     return {
         __proto__: null,
         "./worxide_example_bg.js": import0,
-        "./snippets/worxide-b41acc353c4bdba2/inline0.js": import1,
+        "./snippets/worxide-983f3759d96de773/inline0.js": import1,
     };
 }
 
