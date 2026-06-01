@@ -1,9 +1,37 @@
 <!DOCTYPE html>
 <html lang="en">
+
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>worxide</title>
+
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bulma@1.0.4/css/bulma.min.css">
+
+  <style>
+    html,
+    body {
+      width: 100svw;
+      height: 100svh;
+      overflow: hidden;
+      margin: 0;
+    }
+
+    .fading-text {
+      animation: fade 0.75s infinite alternate;
+    }
+
+    @keyframes fade {
+      from {
+        color: #fff;
+      }
+
+      to {
+        color: #808080;
+      }
+    }
+  </style>
+
   <script>
     (async () => {
       if (self.crossOriginIsolated) return;
@@ -14,13 +42,15 @@
     })();
   </script>
 </head>
-<body>
+
+<body></body>
+
 <script type="module">
-  import init, { run } from './worxide_example.js';
+  import init, { run_app } from './worxide_example.js';
   if (self.crossOriginIsolated) {
     await init();
-    run();
+    await run_app();
   }
 </script>
-</body>
+
 </html>

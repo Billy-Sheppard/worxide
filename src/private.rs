@@ -11,9 +11,11 @@
 use anyhow::{Context, Result, anyhow};
 use js_sys::{Promise, Reflect};
 use std::cell::RefCell;
+use std::fmt::Display;
 use std::future::Future;
 use std::pin::Pin;
 use std::rc::Rc;
+use std::str::FromStr;
 use std::task::{Poll, RawWaker, RawWakerVTable, Waker};
 use wasm_bindgen::closure::Closure;
 use wasm_bindgen::prelude::*;
@@ -94,7 +96,7 @@ pub unsafe fn unbox_result<T: 'static>(ptr: *mut ()) -> T {
     export function worxide_glue_url(crate_name) {
         // Cargo replaces hyphens with underscores in library output filenames,
         // so a crate named "my-app" produces "my_app.js" / "my_app_bg.wasm".
-        const file_name = crate_name.replace(/-/g, "_");
+        const file_name = crate_name.replace("-", "_");
         return new URL("../../" + file_name + ".js", import.meta.url).href;
     }
 "#)]
@@ -130,8 +132,7 @@ fn js_err(context: &'static str, v: JsValue) -> anyhow::Error {
 
 thread_local! {
     /// Cached glue-file URL, computed once on first spawn. Lives in
-    /// thread-local storage on the main thread (the only place spawns
-    /// originate), so no `unsafe` or `static mut` is needed.
+    /// thread-local storage on the main thread (the only place spawns originate), so no `unsafe` or `static mut` is needed.
     static GLUE_URL: RefCell<Option<String>> = const { RefCell::new(None) };
 }
 
@@ -144,8 +145,7 @@ fn cached_glue_url(crate_name: &str) -> String {
 }
 
 fn worker_url() -> Result<String> {
-    // Create a fresh Blob URL on each spawn. Browsers may revoke or
-    // restrict Blob URLs used by previous Workers, so we don't cache.
+    // Create a fresh Blob URL on each spawn. Browsers may revoke or restrict Blob URLs used by previous Workers, so don't cache.
     let array = js_sys::Array::new();
     array.push(&JsValue::from_str(WORKER_JS));
     let opts = BlobPropertyBag::new();
@@ -155,9 +155,34 @@ fn worker_url() -> Result<String> {
     Url::create_object_url_with_blob(&blob).map_err(|e| js_err("URL.createObjectURL failed", e))
 }
 
+enum WorkerExecution {
+    Sync,
+    Async,
+}
+impl Display for WorkerExecution {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            WorkerExecution::Sync => "sync",
+            WorkerExecution::Async => "async",
+        }
+        .fmt(f)
+    }
+}
+impl FromStr for WorkerExecution {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> std::prelude::v1::Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "sync" => Ok(WorkerExecution::Sync),
+            "async" => Ok(WorkerExecution::Async),
+            other => Err(anyhow::anyhow!("`{other}` is not a valid WorkerExecution!")),
+        }
+    }
+}
+
 /// Spawn a worker, post the task pointer, await the reply.
 /// `kind` is "sync" or "async" — tells worker.js which entry to call.
-async fn run_inner(task_ptr: usize, kind: &str, crate_name: &str) -> Result<usize> {
+async fn run_inner(task_ptr: usize, kind: WorkerExecution, crate_name: &str) -> Result<usize> {
     let glue_url = cached_glue_url(crate_name);
     let worker_url = worker_url()?;
     let module = wasm_bindgen::module();
@@ -188,10 +213,12 @@ async fn run_inner(task_ptr: usize, kind: &str, crate_name: &str) -> Result<usiz
         Closure::once_into_js(move |evt: MessageEvent| {
             let data = evt.data();
             if let Some(n) = data.as_f64() {
-                let _ = resolve.call1(&JsValue::NULL, &JsValue::from_f64(n));
+                resolve
+                    .call1(&JsValue::NULL, &JsValue::from_f64(n))
+                    .unwrap();
             } else {
                 let err = JsValue::from_str("worker posted a non-number reply");
-                let _ = reject.call1(&JsValue::NULL, &err);
+                reject.call1(&JsValue::NULL, &err).unwrap();
             }
         })
     };
@@ -200,13 +227,13 @@ async fn run_inner(task_ptr: usize, kind: &str, crate_name: &str) -> Result<usiz
     let on_error = {
         let reject = reject.clone();
         Closure::once_into_js(move |evt: JsValue| {
-            let _ = reject.call1(&JsValue::NULL, &evt);
+            reject.call1(&JsValue::NULL, &evt).unwrap();
         })
     };
     worker.set_onerror(Some(on_error.unchecked_ref()));
 
     let msg = js_sys::Object::new();
-    Reflect::set(&msg, &"kind".into(), &JsValue::from_str(kind))
+    Reflect::set(&msg, &"kind".into(), &JsValue::from_str(&kind.to_string()))
         .map_err(|e| js_err("set kind on message", e))?;
     Reflect::set(&msg, &"module".into(), &module)
         .map_err(|e| js_err("set module on message", e))?;
@@ -237,7 +264,8 @@ where
     R: 'static,
 {
     let task = WorkerTask::new(move || box_result(f()));
-    let result_ptr = run_inner(task.into_ptr(), "sync", crate_name).await?;
+    let result_ptr = run_inner(task.into_ptr(), WorkerExecution::Sync, crate_name).await?;
+
     // SAFETY: result_ptr came from box_result::<R> on the worker.
     Ok(unsafe { unbox_result::<R>(result_ptr as *mut ()) })
 }
@@ -250,7 +278,8 @@ where
     R: 'static,
 {
     let task = AsyncWorkerTask::new(move || async move { box_result(f().await) });
-    let result_ptr = run_inner(task.into_ptr(), "async", crate_name).await?;
+    let result_ptr = run_inner(task.into_ptr(), WorkerExecution::Async, crate_name).await?;
+
     // SAFETY: result_ptr came from box_result::<R> on the worker.
     Ok(unsafe { unbox_result::<R>(result_ptr as *mut ()) })
 }
@@ -260,12 +289,8 @@ where
 // Drives a future to completion on the worker's own event loop, returning
 // a Promise that resolves with the future's *mut () output (as an f64).
 //
-// Why not wasm_bindgen_futures? With atomics on (needed for shared memory)
-// it uses a multithread executor that coordinates wakeups via
-// Atomics.waitAsync and a helper worker — infrastructure we don't run.
-// Here we reschedule polls through queueMicrotask; JsFuture's own
-// Promise.then wakeups also land on this event loop, so we make progress
-// with no cross-thread machinery.
+// Why not wasm_bindgen_futures? With atomics on (needed for shared memory) it uses a multithread executor that coordinates wakeups via Atomics.waitAsync and a helper worker
+// Reschedule polls through queueMicrotask; JsFuture's own Promise.then wakeups also land on this event loop
 
 type SharedFut = Rc<RefCell<Pin<Box<dyn Future<Output = *mut ()>>>>>;
 
@@ -286,10 +311,12 @@ impl DriveState {
         let mut slot = self.fut.borrow_mut();
         if let Poll::Ready(result_ptr) = slot.as_mut().poll(&mut cx) {
             drop(slot);
-            let _ = self.resolve.call1(
-                &JsValue::NULL,
-                &JsValue::from_f64(result_ptr as usize as f64),
-            );
+            self.resolve
+                .call1(
+                    &JsValue::NULL,
+                    &JsValue::from_f64(result_ptr as usize as f64),
+                )
+                .unwrap();
             // Break the self-cycle so everything can be freed.
             *self.this.borrow_mut() = None;
         }
