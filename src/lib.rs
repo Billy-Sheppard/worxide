@@ -1,21 +1,6 @@
 //! worxide — spawn Rust functions on Web Workers via shared memory.
-//!
-//! worxide runs a Rust function on a Web Worker and awaits its result, while
-//! the calling thread stays free. The whole API is two macros:
-//!
-//! ```ignore
-//! // A synchronous (CPU-bound) function:
-//! fn crunch(n: u32) -> u64 { /* ... */ }
-//! let result = worxide::spawn_blocking!(crunch, 42).await?;
-//!
-//! // An async function:
-//! async fn fetch_and_crunch(n: u32) -> u64 { /* ... */ }
-//! let result = worxide::spawn!(fetch_and_crunch, 42).await?;
-//! ```
-//!
-//! Both return `anyhow::Result<R>`, where `R` is the function's return type
-//! (inferred — no turbofish needed). See the crate README for the required
-//! build flags and cross-origin-isolation setup.
+
+#![doc = include_str!("../README.md")]
 
 #[doc(hidden)]
 pub mod private;

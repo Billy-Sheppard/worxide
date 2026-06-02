@@ -1,23 +1,14 @@
-[workspace]
-resolver = "3"
-members = ["worxide-example"]
-
-[workspace.dependencies]
-anyhow = "1.0.102"
-js-sys = "0.3.99"
-wasm-bindgen = "0.2.122"
-wasm-bindgen-futures = "0.4.72"
-web-sys = { version = "0.3.99", features = [ "Blob", "BlobPropertyBag", "MessageEvent", "Url", "Worker", "WorkerGlobalScope", "WorkerOptions", "WorkerType"] }
-
 [package]
 name = "worxide"
-version = "0.0.1"
+version = "0.0.2"
 edition = "2024"
-license = "MIT"
+
 description = "Fast WASM Workers"
 documentation = "https://docs.rs/worxide/latest/worxide/"
-repository = "https://github.com/Billy-Sheppard/worxide"
 homepage = "https://billy-sheppard.github.io/worxide/"
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/Billy-Sheppard/worxide"
 
 [dependencies]
 anyhow = { workspace = true }
@@ -29,3 +20,14 @@ web-sys = { workspace = true }
 [profile.release]
 opt-level = 3
 lto = true
+
+[workspace]
+resolver = "3"
+members = ["worxide-example"]
+
+[workspace.dependencies]
+anyhow = "1.0.102"
+js-sys = "0.3.99"
+wasm-bindgen = "0.2.122"
+wasm-bindgen-futures = "0.4.72"
+web-sys = { version = "0.3.99", features = [ "Blob", "BlobPropertyBag", "MessageEvent", "Url", "Worker", "WorkerGlobalScope", "WorkerOptions", "WorkerType"] }
