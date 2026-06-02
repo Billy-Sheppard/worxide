@@ -1,47 +1,17 @@
 //! worxide-example
-
 mod html_macros;
-use std::{collections::HashSet, fmt::Debug, hash::Hash, ops::Not, sync::Arc};
+use html_macros::*;
 
 use dominator::events;
 use futures_signals::{
+    map_ref,
     signal::{Mutable, SignalExt},
     signal_vec::{MutableVec, SignalVecExt},
 };
-use html_macros::*;
+use std::{collections::HashSet, future::Future, ops::*, pin::Pin, sync::Arc};
+use wasm_bindgen::{self, JsCast, prelude::*};
 
-use wasm_bindgen::{self, prelude::*};
-
-#[derive(Debug, Clone)]
-struct Job<T, U> {
-    name: Arc<str>,
-    func: Arc<str>,
-    f: fn(T) -> U,
-    param: T,
-    result: Mutable<Option<Result<U, String>>>,
-}
-impl<T: Debug, U> Job<T, U> {
-    fn title(&self) -> String {
-        format!("{}({:?})", self.func, self.param,)
-    }
-}
-impl<T: Hash, U> Hash for Job<T, U> {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.name.hash(state);
-        self.func.hash(state);
-        self.f.hash(state);
-        self.param.hash(state);
-    }
-}
-impl<T: PartialEq, U> PartialEq for Job<T, U> {
-    fn eq(&self, other: &Self) -> bool {
-        self.name == other.name
-            && self.func == other.func
-            && std::ptr::fn_addr_eq(self.f, other.f)
-            && self.param == other.param
-    }
-}
-impl<T: Eq, U> Eq for Job<T, U> {}
+// ── CPU-heavy sample tasks ───────────────────────────────────────────────────
 
 fn fibonacci(n: u64) -> u64 {
     match n {
@@ -50,6 +20,7 @@ fn fibonacci(n: u64) -> u64 {
         _ => fibonacci(n - 1) + fibonacci(n - 2),
     }
 }
+
 fn collatz(limit: u64) -> u64 {
     let mut total = 0u64;
     for start in 1..=limit {
@@ -93,97 +64,134 @@ fn prime_count(limit: u64) -> u64 {
     count
 }
 
-#[wasm_bindgen]
-pub async fn run_app() -> Result<(), JsValue> {
-    #[allow(clippy::mutable_key_type)]
-    let jobs = Mutable::new(HashSet::from([
-        Job {
-            name: Default::default(),
-            func: "fibonacci".into(),
-            f: fibonacci,
-            param: 43,
-            result: Mutable::new(None),
-        },
-        Job {
-            name: Default::default(),
-            func: "collatz".into(),
-            f: collatz,
-            param: 8000000,
-            result: Mutable::new(None),
-        },
-        Job {
-            name: Default::default(),
-            func: "pi_leibniz".into(),
-            f: pi_leibniz,
-            param: 800000000,
-            result: Mutable::new(None),
-        },
-        Job {
-            name: Default::default(),
-            func: "prime_count".into(),
-            f: prime_count,
-            param: 10000000,
-            result: Mutable::new(None),
-        },
-        Job {
-            name: Default::default(),
-            func: "fibonacci".into(),
-            f: fibonacci,
-            param: 44,
-            result: Mutable::new(None),
-        },
-        Job {
-            name: Default::default(),
-            func: "collatz".into(),
-            f: collatz,
-            param: 10000000,
-            result: Mutable::new(None),
-        },
-        Job {
-            name: Default::default(),
-            func: "pi_leibniz".into(),
-            f: pi_leibniz,
-            param: 900000000,
-            result: Mutable::new(None),
-        },
-        Job {
-            name: Default::default(),
-            func: "prime_count".into(),
-            f: prime_count,
-            param: 20000000,
-            result: Mutable::new(None),
-        },
-        Job {
-            name: Default::default(),
-            func: "fibonacci".into(),
-            f: fibonacci,
-            param: 45,
-            result: Mutable::new(None),
-        },
-        Job {
-            name: Default::default(),
-            func: "collatz".into(),
-            f: collatz,
-            param: 20000000,
-            result: Mutable::new(None),
-        },
-        Job {
-            name: Default::default(),
-            func: "pi_leibniz".into(),
-            f: pi_leibniz,
-            param: 1000000000,
-            result: Mutable::new(None),
-        },
-        Job {
-            name: Default::default(),
-            func: "prime_count".into(),
-            f: prime_count,
-            param: 30000000,
-            result: Mutable::new(None),
-        },
-    ]));
+async fn deserialize_json(url: &str) -> anyhow::Result<(usize, serde_json::Value)> {
+    let body = reqwest::get(url).await?.error_for_status()?.bytes().await?;
+    let size = body.len();
+    let res = serde_json::from_slice(&body)?;
 
-    let mut names = HashSet::from([
+    Ok((size, res))
+}
+
+type RunFuture = Pin<Box<dyn Future<Output = Result<String, String>>>>;
+
+/// Where a job runs: on a worxide worker, or inline on the main thread (which
+/// blocks the UI — useful for demonstrating the difference).
+#[derive(Clone, Copy, PartialEq)]
+enum Mode {
+    Worker,
+    MainThread,
+}
+
+struct PoolTask {
+    title: String,
+    run: Box<dyn FnOnce(Mode) -> RunFuture>,
+}
+
+fn sync_task(func: &str, f: fn(u64) -> u64, param: u64) -> PoolTask {
+    PoolTask {
+        title: format!("{func}({param})"),
+        run: Box::new(move |mode| {
+            Box::pin(async move {
+                match mode {
+                    Mode::Worker => worxide::spawn_blocking!(f, param)
+                        .await
+                        .map(|r| format!("Res: {r}"))
+                        .map_err(|e| e.to_string()),
+                    // Runs inline on the main thread — blocks the UI until done.
+                    Mode::MainThread => Ok(format!("Res: {}", f(param))),
+                }
+            })
+        }),
+    }
+}
+
+fn build_pool() -> Vec<PoolTask> {
+    let mut pool = vec![
+        sync_task("fibonacci", fibonacci, 43),
+        sync_task("collatz", collatz, 8_000_000),
+        sync_task("pi_leibniz", pi_leibniz, 800_000_000),
+        sync_task("prime_count", prime_count, 10_000_000),
+        sync_task("fibonacci", fibonacci, 44),
+        sync_task("collatz", collatz, 10_000_000),
+        sync_task("pi_leibniz", pi_leibniz, 900_000_000),
+        sync_task("prime_count", prime_count, 20_000_000),
+        sync_task("fibonacci", fibonacci, 45),
+        sync_task("collatz", collatz, 20_000_000),
+        sync_task("pi_leibniz", pi_leibniz, 1_000_000_000),
+        sync_task("prime_count", prime_count, 30_000_000),
+    ];
+
+    pool.push(PoolTask {
+        title: "deserialize_5mb_json".into(),
+        run: Box::new(move |mode| {
+            Box::pin(async move {
+                let url = "https://raw.githubusercontent.com/json-iterator/test-data/refs/heads/master/large-file.json";
+                let res = match mode {
+                    Mode::Worker => worxide::spawn!(deserialize_json, url)
+                        .await
+                        .map_err(|e| e.to_string())
+                        .and_then(|v| v.map_err(|e| e.to_string())),
+                    // Runs inline on the main thread.
+                    Mode::MainThread => deserialize_json(url).await.map_err(|e| e.to_string()),
+                };
+                res.map(|(size, res)| {
+                    let n = res.as_array().map(|a| a.len()).unwrap_or(0);
+                    format!("Parsed {n} entries ({} bytes)", size)
+                })
+            })
+        }),
+    });
+
+    pool
+}
+
+#[derive(Clone)]
+struct Worker {
+    name: Arc<str>,
+    title: Arc<str>,
+    result: Mutable<Option<Result<String, String>>>,
+}
+
+fn spawn_job(
+    names: &Mutable<HashSet<&'static str>>,
+    pool: &Mutable<Vec<PoolTask>>,
+    workers: &MutableVec<Arc<Worker>>,
+    mode: Mode,
+) -> bool {
+    let key = {
+        let mut g = names.lock_mut();
+        let Some(k) = g.iter().next().cloned() else {
+            return false;
+        };
+        g.take(&k).unwrap()
+    };
+
+    let task = {
+        let mut g = pool.lock_mut();
+        if g.is_empty() {
+            return false;
+        }
+        let idx = ((js_sys::Math::random() * g.len() as f64) as usize).min(g.len() - 1);
+        g.remove(idx)
+    };
+
+    let worker = Arc::new(Worker {
+        name: key.into(),
+        title: Arc::from(task.title.as_str()),
+        result: Mutable::new(None),
+    });
+    workers.lock_mut().push_cloned(worker.clone());
+
+    wasm_bindgen_futures::spawn_local(async move {
+        let r = (task.run)(mode).await;
+        worker.result.set(Some(r));
+    });
+
+    true
+}
+
+fn worker_names() -> HashSet<&'static str> {
+    HashSet::from([
         "Abigail",
         "Alexander",
         "Alexis",
@@ -234,118 +242,206 @@ pub async fn run_app() -> Result<(), JsValue> {
         "Tyler",
         "Victoria",
         "William",
-    ]);
+    ])
+}
 
-    let workers: MutableVec<Arc<Job<u64, u64>>> = MutableVec::new();
+#[wasm_bindgen]
+pub async fn run_app() -> Result<(), JsValue> {
+    let pool = Mutable::new(build_pool());
+    let workers: MutableVec<Arc<Worker>> = MutableVec::new();
 
-    let header = html_div()
-        .class(["columns"])
-        .child(
-            html_div()
-                .class(["column", "is-narrow"])
-                .child(html_h1().class("title").text("worxide").into_dom())
-                .into_dom(),
-        )
-        .child(
-            html_div()
-                .class(["column", "is-narrow"])
-                .child(
-                    html_button()
-                        .class(["button", "fading-text"])
-                        .style("height", "100%")
-                        .text("main thread stays active")
-                        .into_dom(),
-                )
-                .into_dom(),
-        )
-        .child(
-            html_div()
-                .class(["column", "is-narrow"])
-                .child(
-                    html_button()
-                        .class(["button", "fading-text"])
-                        .style("height", "100%")
-                        .text("Main thread FPS: ")
-                        .into_dom(),
-                )
-                .into_dom(),
-        )
-        .child(
-            html_div()
-                .class(["column", "is-narrow"])
-                .child(
-                    html_button()
-                        .class(["button", "fading-text"])
-                        .style("height", "100%")
-                        .text("CPU Pressure")
-                        .into_dom(),
-                )
-                .into_dom(),
-        )
-        .child(
-            html_div()
-                .class("column")
-                .child(
-                    html_button()
-                        .class(["button", "is-loading"])
-                        .visible_signal(
-                            workers
-                                .signal_vec_cloned()
-                                .map_signal(|worker| worker.result.signal_cloned())
-                                .to_signal_cloned()
-                                .map(|vec: Vec<Option<Result<u64, String>>>| {
-                                    vec.iter().any(Option::is_none)
-                                }),
+    let names = Mutable::new(worker_names());
+    let mode = Mutable::new(Mode::Worker);
+
+    let header = {
+        let fps = Mutable::new(60.0);
+        let pressure: Mutable<Option<String>> = Mutable::new(None);
+        let has_pressure = pressure_supported();
+
+        start_fps_meter(fps.clone());
+        if has_pressure {
+            start_pressure_observer(pressure.clone());
+        }
+
+        html_div()
+            .class(["columns"])
+            .child(
+                html_div()
+                    .class(["column", "is-narrow"])
+                    .child(html_h1().class("title").text("worxide").into_dom())
+                    .into_dom(),
+            )
+            .child(
+                html_div()
+                    .class(["column", "is-narrow", "buttons", "has-addons"])
+                    .child(
+                        html_button()
+                            .class(["button", "fading-text"])
+                            .style("height", "100%")
+                            .text("main thread stays active")
+                            .into_dom(),
+                    )
+                    .child_signal({
+                        let workers = workers.clone();
+                        workers
+                            .signal_vec_cloned()
+                            .map_signal(|worker| worker.result.signal_cloned())
+                            .to_signal_cloned()
+                            .map(|vec: Vec<Option<Result<String, String>>>| {
+                                vec.iter().any(Option::is_none).then_some(
+                                    html_button()
+                                        .class(["button", "is-loading"])
+                                        .style("height", "100%")
+                                        .into_dom(),
+                                )
+                            })
+                    })
+                    .child(
+                        html_button()
+                            .class("button")
+                            .style("height", "100%")
+                            .text_signal(fps.signal().map(|f| format!("Main thread FPS: {:.2}", f)))
+                            .into_dom(),
+                    )
+                    .apply_if(has_pressure, |d| {
+                        d.child(
+                            html_button()
+                                .class("button")
+                                .style("height", "100%")
+                                .text_signal(pressure.signal_cloned().map(|p| {
+                                    format!("CPU Pressure: {}", p.unwrap_or_else(|| "—".into()))
+                                }))
+                                .into_dom(),
                         )
-                        .style("height", "100%")
-                        .into_dom(),
-                )
-                .into_dom(),
-        )
-        .into_dom();
+                    })
+                    .into_dom(),
+            )
+            .into_dom()
+    };
 
     let dom = html_div()
         .class(["section"])
         .child(header)
         .child(
-            html_button()
-                .class(["button", "is-success"])
-                .text("Spawn Worker")
-                .visible_signal(jobs.signal_ref(|j| j.is_empty().not()))
-                .event({
-                    let workers = workers.clone();
-                    let jobs = jobs.clone();
-                    move |_: events::Click| {
-                        let key = match names.iter().next().cloned().and_then(|k| names.take(k)) {
-                            Some(k) => k,
-                            None => return,
-                        };
-
-                        let job = {
-                            let mut g = jobs.lock_mut();
-                            let Some(k) = g.iter().next().cloned() else {
-                                return;
-                            };
-                            g.take(&k)
-                        };
-                        let Some(mut job) = job else { return };
-
-                        job.name = key.into();
-                        let job = Arc::from(job);
-
-                        workers.lock_mut().push_cloned(job.clone());
-
-                        wasm_bindgen_futures::spawn_local(async move {
-                            let f = job.f;
-                            let param = job.param;
-                            job.result.set(Some(
-                                worxide::spawn_blocking!(f, param)
-                                    .await
-                                    .map_err(|e| e.to_string()),
-                            ));
-                        });
-                    }
-                })
+            html_div()
+                .class(["columns"])
+                .child(
+                    html_div()
+                        .class(["column", "is-narrow", "buttons", "has-addons"])
+                        .child(
+                            html_button()
+                                .class("button")
+                                .class_signal("is-info", mode.signal().map(|m| m == Mode::Worker))
+                                .text("Worker Threads")
+                                .event({
+                                    let mode = mode.clone();
+                                    move |_: events::Click| mode.set(Mode::Worker)
+                                })
+                                .into_dom(),
+                        )
+                        .child(
+                            html_button()
+                                .class("button")
+                                .class_signal(
+                                    "is-warning",
+                                    mode.signal().map(|m| m == Mode::MainThread),
+                                )
+                                .text("Main Thread")
+                                .event({
+                                    let mode = mode.clone();
+                                    move |_: events::Click| mode.set(Mode::MainThread)
+                                })
+                                .into_dom(),
+                        )
+                        .into_dom(),
+                )
+                .child(
+                    html_div()
+                        .class(["column", "is-narrow", "buttons", "has-addons"])
+                        .child_signal({
+                            let workers = workers.clone();
+                            let pool = pool.clone();
+                            let names = names.clone();
+                            let mode = mode.clone();
+                            pool.signal_ref(|p| p.is_empty()).map(move |empty| {
+                                empty.not().then_some(
+                                    html_button()
+                                        .class(["button", "is-success"])
+                                        .text("Spawn Jobs")
+                                        .event({
+                                            let workers = workers.clone();
+                                            let pool = pool.clone();
+                                            let names = names.clone();
+                                            let mode = mode.clone();
+                                            move |_: events::Click| {
+                                                spawn_job(&names, &pool, &workers, mode.get());
+                                            }
+                                        })
+                                        .into_dom(),
+                                )
+                            })
+                        })
+                        .child_signal({
+                            let workers = workers.clone();
+                            let pool = pool.clone();
+                            let names = names.clone();
+                            let mode = mode.clone();
+                            pool.signal_ref(|p| p.is_empty()).map(move |empty| {
+                                empty.not().then_some(
+                                    html_button()
+                                        .class(["button", "is-link"])
+                                        .text("Spawn All Jobs")
+                                        .event({
+                                            let workers = workers.clone();
+                                            let pool = pool.clone();
+                                            let names = names.clone();
+                                            let mode = mode.clone();
+                                            move |_: events::Click| {
+                                                while spawn_job(&names, &pool, &workers, mode.get())
+                                                {
+                                                }
+                                            }
+                                        })
+                                        .into_dom(),
+                                )
+                            })
+                        })
+                        .child_signal({
+                            let workers = workers.clone();
+                            let pool = pool.clone();
+                            let names = names.clone();
+                            map_ref! {
+                                let pool_empty = pool.signal_ref(|p| p.is_empty()),
+                                let all_done = workers
+                                    .signal_vec_cloned()
+                                    .map_signal(|worker| worker.result.signal_cloned())
+                                    .to_signal_cloned()
+                                    .map(|vec: Vec<Option<Result<String, String>>>| {
+                                        vec.iter().all(Option::is_some)
+                                    }),
+                                let any_workers = workers.signal_vec_cloned()
+                                    .to_signal_cloned()
+                                    .map(|v| v.is_empty().not())
+                                => (*pool_empty && *all_done && *any_workers).then_some(
+                                    html_button()
+                                        .class(["button", "is-danger"])
+                                        .text("Reset")
+                                        .event({
+                                            let workers = workers.clone();
+                                            let pool = pool.clone();
+                                            let names = names.clone();
+                                            move |_: events::Click| {
+                                                workers.lock_mut().clear();
+                                                *pool.lock_mut() = build_pool();
+                                                *names.lock_mut() = worker_names();
+                                            }
+                                        })
+                                        .into_dom(),
+                                )
+                            }
+                        })
+                        .into_dom(),
+                )
                 .into_dom(),
         )
         .child(
@@ -371,21 +467,24 @@ pub async fn run_app() -> Result<(), JsValue> {
                                                 .text(worker.name.as_ref())
                                                 .into_dom(),
                                         )
-                                        .child(html_h3().text(&worker.title()).into_dom())
-                                        .child_signal(worker.result.signal_ref(|res| {
-                                            html_button()
-                                                .class("button")
-                                                .style("width", "100%")
-                                                .style("height", "40px")
-                                                .apply_if(res.is_none(), |b| b.class("is-loading"))
-                                                .apply_if(res.is_some(), |b| {
-                                                    b.text(&match res.as_ref().unwrap() {
-                                                        Ok(res) => format!("Res: {}", res),
-                                                        Err(e) => e.to_string(),
+                                        .child(html_h3().text(worker.title.as_ref()).into_dom())
+                                        .child_signal(worker.result.signal_cloned().map(|res| {
+                                            Some(
+                                                html_button()
+                                                    .class("button")
+                                                    .style("width", "100%")
+                                                    .style("height", "40px")
+                                                    .apply_if(res.is_none(), |b| {
+                                                        b.class("is-loading")
                                                     })
-                                                })
-                                                .into_dom()
-                                                .into()
+                                                    .apply_if(res.is_some(), |b| {
+                                                        b.text(match res.as_ref().unwrap() {
+                                                            Ok(s) => s.as_str(),
+                                                            Err(e) => e.as_str(),
+                                                        })
+                                                    })
+                                                    .into_dom(),
+                                            )
                                         }))
                                         .into_dom(),
                                 )
@@ -399,4 +498,96 @@ pub async fn run_app() -> Result<(), JsValue> {
 
     dominator::append_dom(&dominator::body(), dom);
     Ok(())
+}
+
+fn pressure_supported() -> bool {
+    js_sys::Reflect::get(&js_sys::global(), &JsValue::from_str("PressureObserver"))
+        .map(|v| !v.is_undefined())
+        .unwrap_or(false)
+}
+
+fn start_fps_meter(fps: Mutable<f64>) {
+    let last = Mutable::new(now_ms());
+    let callback = Mutable::<Option<Closure<dyn FnMut()>>>::new(None);
+    let cb = callback.clone();
+    callback.set(Some(Closure::wrap(Box::new(move || {
+        let t = now_ms();
+        let dt = t - last.get();
+        last.set(t);
+        if dt.gt(&0.0) {
+            let inst = 1000.0.div(dt);
+            let prev = fps.get();
+            fps.set(prev.mul(0.9).add(inst.mul(0.1)));
+        }
+        if let Some(w) = web_sys::window()
+            && let Some(c) = cb.lock_ref().as_ref()
+        {
+            w.request_animation_frame(c.as_ref().unchecked_ref())
+                .unwrap();
+        }
+    }) as Box<dyn FnMut()>)));
+
+    if let Some(w) = web_sys::window()
+        && let Some(c) = callback.lock_ref().as_ref()
+    {
+        w.request_animation_frame(c.as_ref().unchecked_ref())
+            .unwrap();
+    }
+}
+
+fn start_pressure_observer(pressure: Mutable<Option<String>>) {
+    let constructor = if let Ok(v) =
+        js_sys::Reflect::get(&js_sys::global(), &JsValue::from_str("PressureObserver"))
+        && v.is_null_or_undefined().not()
+    {
+        v.unchecked_into::<js_sys::Function>()
+    } else {
+        return;
+    };
+
+    let cb = Closure::wrap(Box::new(move |records: JsValue| {
+        if let Ok(arr) = records.dyn_into::<js_sys::Array>() {
+            let len = arr.length();
+            if len.gt(&0)
+                && let Ok(s) =
+                    js_sys::Reflect::get(&arr.get(len.sub(1)), &JsValue::from_str("state"))
+                && let Some(s) = s.as_string()
+            {
+                pressure.set(Some(s));
+            }
+        }
+    }) as Box<dyn FnMut(JsValue)>);
+
+    let observer = if let Ok(o) = js_sys::Reflect::construct(
+        &constructor,
+        &js_sys::Array::of1(cb.as_ref().unchecked_ref()),
+    ) {
+        o
+    } else {
+        cb.forget();
+        return;
+    };
+    cb.forget();
+
+    if let Ok(observe) = js_sys::Reflect::get(&observer, &JsValue::from_str("observe"))
+        && let Ok(observe_fn) = observe.dyn_into::<js_sys::Function>()
+    {
+        let opts = js_sys::Object::new();
+        js_sys::Reflect::set(
+            &opts,
+            &JsValue::from_str("sampleInterval"),
+            &JsValue::from_f64(500.0),
+        )
+        .unwrap();
+        observe_fn
+            .call2(&observer, &JsValue::from_str("cpu"), &opts)
+            .unwrap();
+    }
+}
+
+fn now_ms() -> f64 {
+    web_sys::window()
+        .and_then(|w| w.performance())
+        .map(|p| p.now())
+        .unwrap_or(0.0)
 }

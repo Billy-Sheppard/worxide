@@ -1,5 +1,9 @@
 # worxide
 
+<p align="center">
+  <img src="./docs/worxide.png" alt="icon" width="500">
+</p>
+
 Spawn a Rust function on a Web Worker and `await` its result — passing **any
 `T`** in and out with **no serialization, no deserialization, and no copying**.
 

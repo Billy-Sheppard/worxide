@@ -12,6 +12,9 @@ dominator = "0.5.38"
 futures-signals = "0.3.34"
 gloo = "0.12.0"
 js-sys = { workspace = true }
+# serde = "1.0.228"
+serde_json = "1.0.150"
+reqwest = { version = "0.13.4", features = ["json"] }
 wasm-bindgen = { workspace = true }
 wasm-bindgen-futures = { workspace = true }
 web-sys = { workspace = true, features = [
