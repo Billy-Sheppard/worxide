@@ -120,8 +120,12 @@ Cross-Origin-Embedder-Policy: require-corp
 <body>
 </body>
 <script type="module">
+  // If you need to override the calculated path for your apps javascript do so like this
+  globalThis.app_js_path = './your_app.js';
+  
   import init, { run_app } from './your_app.js';
   if (self.crossOriginIsolated) {
+
     await init();
     await run_app();
   }

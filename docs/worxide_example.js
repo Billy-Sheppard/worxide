@@ -1,6 +1,21 @@
-import { worxide_glue_url } from './snippets/worxide-983f3759d96de773/inline1.js';
-import * as import1 from "./snippets/worxide-983f3759d96de773/inline0.js"
+import { worxide_app_js_path, worxide_glue_url, worxide_glue_url_from_path } from './snippets/worxide-83425a82d5813cec/inline0.js';
+import * as import1 from "./snippets/worxide-83425a82d5813cec/inline1.js"
 
+
+/**
+ * Seed this thread's resolved glue-URL cache.
+ *
+ * Called by `worker.js` immediately after `initSync`, passing the `glue_url`
+ * the worker received over `postMessage`. This makes any *nested* spawn the
+ * worker performs reuse the already-resolved URL instead of re-deriving it —
+ * crucial because `window` / `globalThis.app_js_path` is not set on workers.
+ * @param {string} url
+ */
+export function __worxide_seed_glue_url(url) {
+    const ptr0 = passStringToWasm0(url, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    wasm.__worxide_seed_glue_url(ptr0, len0);
+}
 
 /**
  * Worker thread entry point for sync tasks. Returns the result pointer bytes.
@@ -19,8 +34,7 @@ export function __worxide_worker_entry(ptr_bytes) {
 /**
  * Worker thread entry point for async tasks. Returns a Promise that
  * resolves with the result pointer bytes once the task's future completes.
- *
- * We deliberately avoid `wasm_bindgen_futures::future_to_promise` /
+ * We deliberately avoid `wasm_bindgen_futures::future_to_promise`
  * `spawn_local` here. With atomics enabled (required for shared memory),
  * wasm-bindgen-futures selects its *multithread* executor, which schedules
  * wakeups through `Atomics.waitAsync` and a coordinator worker. That
@@ -598,9 +612,24 @@ function __wbg_get_imports(memory) {
             const ret = Atomics.waitAsync;
             return ret;
         },
-        __wbg_worxide_glue_url_b29e9f74d8b16db9: function(arg0, arg1, arg2) {
+        __wbg_worxide_app_js_path_14fa5d02e4f69949: function(arg0) {
+            const ret = worxide_app_js_path();
+            var ptr1 = isLikeNone(ret) ? 0 : passStringToWasm0(ret, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+            var len1 = WASM_VECTOR_LEN;
+            getDataViewMemory0().setInt32(arg0 + 4 * 1, len1, true);
+            getDataViewMemory0().setInt32(arg0 + 4 * 0, ptr1, true);
+        },
+        __wbg_worxide_glue_url_24e49845dec3cdd2: function(arg0, arg1, arg2) {
             var v0 = getCachedStringFromWasm0(arg1, arg2);
             const ret = worxide_glue_url(v0);
+            const ptr2 = passStringToWasm0(ret, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+            const len2 = WASM_VECTOR_LEN;
+            getDataViewMemory0().setInt32(arg0 + 4 * 1, len2, true);
+            getDataViewMemory0().setInt32(arg0 + 4 * 0, ptr2, true);
+        },
+        __wbg_worxide_glue_url_from_path_99483da337e797cb: function(arg0, arg1, arg2) {
+            var v0 = getCachedStringFromWasm0(arg1, arg2);
+            const ret = worxide_glue_url_from_path(v0);
             const ptr2 = passStringToWasm0(ret, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
             const len2 = WASM_VECTOR_LEN;
             getDataViewMemory0().setInt32(arg0 + 4 * 1, len2, true);
@@ -670,7 +699,7 @@ function __wbg_get_imports(memory) {
     return {
         __proto__: null,
         "./worxide_example_bg.js": import0,
-        "./snippets/worxide-983f3759d96de773/inline0.js": import1,
+        "./snippets/worxide-83425a82d5813cec/inline1.js": import1,
     };
 }
 

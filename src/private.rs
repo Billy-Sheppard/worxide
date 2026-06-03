@@ -35,6 +35,90 @@ const WORKER_JS: &str = include_str!("worker.js");
 /// can exceed the 2^53 exact-integer range of a double.
 const PTR_LEN: usize = std::mem::size_of::<usize>();
 
+thread_local! {
+    /// Cached glue-file URL, resolved once per thread.
+    ///
+    /// On the main thread it is computed on first spawn (see `cached_glue_url`).
+    /// On a worker it is *seeded* with the URL received over `postMessage` (see
+    /// `__worxide_seed_glue_url`), so any nested spawn the worker performs
+    /// reuses that already-resolved URL instead of re-deriving it.
+    static GLUE_URL: RefCell<Option<String>> = const { RefCell::new(None) };
+}
+
+// Glue-URL resolvers (main-thread only — workers receive the resolved URL over
+// postMessage and never call these).
+//
+//  * `worxide_glue_url`          — bare name, resolved relative to the snippet.
+//  * `worxide_glue_url_from_path`— explicit path/URL, resolved against the page.
+//  * `worxide_app_js_path`       — optional `globalThis.app_js_path` the
+//                                  consumer may set in HTML; `None` if unset.
+#[wasm_bindgen(inline_js = r#"
+    export function worxide_glue_url(crate_name) {
+        // Cargo replaces hyphens with underscores in library output filenames,
+        // so a crate named "my-app" produces "my_app.js". Strip a trailing
+        // ".js" so callers may pass either form.
+        const file = crate_name.replace(/-/g, "_").replace(/\.js$/, "");
+        return new URL("../../" + file + ".js", import.meta.url).href;
+    }
+    export function worxide_glue_url_from_path(path) {
+        // Resolve against the document base; do NOT mangle the string.
+        return new URL(path, document.baseURI).href;
+    }
+    export function worxide_app_js_path() {
+        // Optional consumer-set global, e.g. one line in HTML:
+        //   globalThis.app_js_path = "my_app.js";   // or "/static/my_app.js"
+        // Read from globalThis so it is safe to call from any context; returns
+        // null when unset / not a non-empty string so wasm-bindgen maps it to
+        // `None`.
+        const p = globalThis.app_js_path;
+        return (typeof p === "string" && p.length > 0) ? p : null;
+    }
+"#)]
+extern "C" {
+    fn worxide_glue_url(crate_name: &str) -> String;
+    fn worxide_glue_url_from_path(path: &str) -> String;
+    fn worxide_app_js_path() -> Option<String>;
+}
+
+/// Resolve (and memoize) the glue-file URL for *this* thread.
+///
+/// Precedence:
+///   1. the consumer-set `globalThis.app_js_path` global (resolved against the
+///      page base, used verbatim),
+///   2. the crate name the macro captured via `CARGO_PKG_NAME` (correct for a
+///      single-crate app; see the note in `lib.rs` about libraries).
+///
+/// Resolution happens once and is memoized, so `globalThis.app_js_path` must be
+/// set before the first spawn. On a worker, `GLUE_URL` has already been seeded
+/// with the resolved URL (see `__worxide_seed_glue_url`), so neither resolver
+/// runs there — which is why a worker never needs a global it cannot see.
+fn cached_glue_url(crate_name: &str) -> String {
+    GLUE_URL.with(|cell| {
+        cell.borrow_mut()
+            .get_or_insert_with(|| {
+                if let Some(p) = worxide_app_js_path() {
+                    // A consumer-supplied path/name; resolve it against the page
+                    // base rather than mangling it like a crate name.
+                    worxide_glue_url_from_path(&p)
+                } else {
+                    worxide_glue_url(crate_name)
+                }
+            })
+            .clone()
+    })
+}
+
+fn worker_url() -> Result<String> {
+    // Create a fresh Blob URL on each spawn. Browsers may revoke or restrict Blob URLs used by previous Workers, so don't cache.
+    let array = js_sys::Array::new();
+    array.push(&JsValue::from_str(WORKER_JS));
+    let opts = BlobPropertyBag::new();
+    opts.set_type("application/javascript");
+    let blob = Blob::new_with_str_sequence_and_options(&array, &opts)
+        .map_err(|e| js_err("Blob construction failed", e))?;
+    Url::create_object_url_with_blob(&blob).map_err(|e| js_err("URL.createObjectURL failed", e))
+}
+
 /// Sync task: closure returns the boxed result pointer directly.
 pub struct WorkerTask {
     func: Box<dyn FnOnce() -> *mut () + Send>,
@@ -138,23 +222,6 @@ fn decode_task_ptr(bytes: &[u8]) -> usize {
     usize::from_le_bytes(buf)
 }
 
-/// JS snippet bundled into the wasm-bindgen output. Resolves the URL of
-/// the consumer's wasm-bindgen glue file. The consumer's crate name is
-/// passed in by the macro via env!("CARGO_PKG_NAME").
-//// The snippet lives at `snippets/worxide-<hash>/inline0.js`, two dirs
-/// below the wasm-bindgen output root — hence the `../../` prefix.
-#[wasm_bindgen(inline_js = r#"
-    export function worxide_glue_url(crate_name) {
-        // Cargo replaces hyphens with underscores in library output filenames,
-        // so a crate named "my-app" produces "my_app.js" / "my_app_bg.wasm".
-        const file_name = crate_name.replace("-", "_");
-        return new URL("../../" + file_name + ".js", import.meta.url).href;
-    }
-"#)]
-extern "C" {
-    fn worxide_glue_url(crate_name: &str) -> String;
-}
-
 fn js_err(context: &'static str, v: JsValue) -> anyhow::Error {
     // Try a sequence of strategies to get something readable.
     // 1. If it's already a string.
@@ -179,31 +246,6 @@ fn js_err(context: &'static str, v: JsValue) -> anyhow::Error {
         .and_then(|s| s.as_string())
         .unwrap_or_else(|| "<unprintable JsValue>".to_owned());
     anyhow!("{context}: {stringified}")
-}
-
-thread_local! {
-    /// Cached glue-file URL, computed once on first spawn. Lives in
-    /// thread-local storage on the main thread (the only place spawns originate), so no `unsafe` or `static mut` is needed.
-    static GLUE_URL: RefCell<Option<String>> = const { RefCell::new(None) };
-}
-
-fn cached_glue_url(crate_name: &str) -> String {
-    GLUE_URL.with(|cell| {
-        cell.borrow_mut()
-            .get_or_insert_with(|| worxide_glue_url(crate_name))
-            .clone()
-    })
-}
-
-fn worker_url() -> Result<String> {
-    // Create a fresh Blob URL on each spawn. Browsers may revoke or restrict Blob URLs used by previous Workers, so don't cache.
-    let array = js_sys::Array::new();
-    array.push(&JsValue::from_str(WORKER_JS));
-    let opts = BlobPropertyBag::new();
-    opts.set_type("application/javascript");
-    let blob = Blob::new_with_str_sequence_and_options(&array, &opts)
-        .map_err(|e| js_err("Blob construction failed", e))?;
-    Url::create_object_url_with_blob(&blob).map_err(|e| js_err("URL.createObjectURL failed", e))
 }
 
 #[derive(Clone, Copy)]
@@ -288,6 +330,9 @@ async fn construct_worker(
     // Pointer travels as little-endian bytes (a Uint8Array), never as an f64.
     Reflect::set(&msg, &"ptr".into(), &ptr_to_js(task_ptr))
         .map_err(|e| js_err("set ptr on message", e))?;
+    // The *resolved* glue URL goes over the wire so the worker (and any nested
+    // spawn it makes) never has to re-derive it from a crate name or a global
+    // it can't see. worker.js feeds this to `__worxide_seed_glue_url`.
     Reflect::set(&msg, &"glue_url".into(), &JsValue::from_str(&glue_url))
         .map_err(|e| js_err("set glue_url on message", e))?;
 
@@ -484,9 +529,21 @@ extern "C" {
 // These are #[wasm_bindgen] exports (so they end up callable in the worker's
 // glue) and therefore must be `pub`. The leading `__worxide_` and their
 // presence in this hidden module mark them as internal.
-// They take the task pointer as little-endian `&[u8]` and return the result
-// pointer as little-endian `Vec<u8>` (a Uint8Array on the JS side). worker.js
-// forwards these payloads verbatim and never converts them to a number.
+// The entry points take the task pointer as little-endian `&[u8]` and return
+// the result pointer as little-endian `Vec<u8>` (a Uint8Array on the JS side).
+// worker.js forwards these payloads verbatim and never converts them to a
+// number.
+
+/// Seed this thread's resolved glue-URL cache.
+///
+/// Called by `worker.js` immediately after `initSync`, passing the `glue_url`
+/// the worker received over `postMessage`. This makes any *nested* spawn the
+/// worker performs reuse the already-resolved URL instead of re-deriving it —
+/// crucial because `window` / `globalThis.app_js_path` is not set on workers.
+#[wasm_bindgen]
+pub fn __worxide_seed_glue_url(url: String) {
+    GLUE_URL.with(|cell| *cell.borrow_mut() = Some(url));
+}
 
 /// Worker thread entry point for sync tasks. Returns the result pointer bytes.
 #[wasm_bindgen]

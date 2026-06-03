@@ -1,17 +1,16 @@
 //! worxide-example
 mod html_macros;
-use html_macros::*;
-
-use dominator::events;
-use futures_signals::{
-    map_ref,
-    signal::{Mutable, SignalExt},
-    signal_vec::{MutableVec, SignalVecExt},
+use {
+    dominator::events,
+    futures_signals::{
+        map_ref,
+        signal::{Mutable, SignalExt},
+        signal_vec::{MutableVec, SignalVecExt},
+    },
+    html_macros::*,
+    std::{collections::HashSet, future::Future, ops::*, pin::Pin, sync::Arc},
+    wasm_bindgen::{self, JsCast, prelude::*},
 };
-use std::{collections::HashSet, future::Future, ops::*, pin::Pin, sync::Arc};
-use wasm_bindgen::{self, JsCast, prelude::*};
-
-// ── CPU-heavy sample tasks ───────────────────────────────────────────────────
 
 fn fibonacci(n: u64) -> u64 {
     match n {
