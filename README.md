@@ -1,8 +1,11 @@
 # worxide
 
 <p align="center">
-  <img src="./docs/worxide.png" alt="icon" width="500">
+  <img src="https://github.com/Billy-Sheppard/worxide/raw/main/docs/worxide.png" alt="icon" width="500">
 </p>
+
+[![crates.io](https://img.shields.io/crates/v/worxide.svg)](https://crates.io/crates/worxide)
+[![docs.rs](https://docs.rs/worxide/badge.svg)](https://docs.rs/worxide)
 
 Spawn a Rust function on a Web Worker and `await` its result - passing **any `T`** in and out with **no serialization, no deserialization, and no copying/cloning**.
 
