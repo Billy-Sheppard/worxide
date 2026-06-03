@@ -13,8 +13,10 @@
 // shared memory and allocates this thread's own TLS block. We don't manage
 // TLS, memory, or __wbindgen_start ordering by hand.
 //
-// `glue_url` is resolved at runtime (the consumer's crate name isn't known at
-// build time) and passed in via postMessage from the main thread.
+// `glue_url` is resolved on the main thread and passed in via postMessage. We
+// re-seed it into this worker's own resolved-URL cache (see below) so that any
+// *nested* spawn this worker performs reuses it instead of re-deriving from a
+// crate name or a `globalThis.app_js_path` that only exists on the page.
 
 // Surface worker-side errors in the page console for diagnostics. Async
 // rejections reach the unhandledrejection listener on their own.
@@ -28,6 +30,13 @@ self.onmessage = async ({ data: { kind, module, memory, ptr, glue_url } }) => {
     // thread. wasm-bindgen's generated initSync handles TLS allocation and
     // per-thread __wbindgen_start for this instance.
     glue.initSync({ module, memory });
+
+    // Plant the already-resolved glue URL in this worker's thread-local cache
+    // BEFORE running the task. If the task makes nested spawns, they'll find
+    // the cache populated and forward this same URL onward — workers can't see
+    // the page's `globalThis.app_js_path`, so without this they'd fall back to
+    // the (wrong) crate name. Must run after initSync and before the entry call.
+    glue.__worxide_seed_glue_url(glue_url);
 
     const result_ptr = kind === 'sync'
         ? glue.__worxide_worker_entry(ptr)

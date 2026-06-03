@@ -1,5 +1,5 @@
-import { worxide_app_js_path, worxide_glue_url, worxide_glue_url_from_path } from './snippets/worxide-83425a82d5813cec/inline0.js';
-import * as import1 from "./snippets/worxide-83425a82d5813cec/inline1.js"
+import { worxide_app_js_path, worxide_glue_url, worxide_glue_url_from_path } from './snippets/worxide-6b429b9ecf2d0121/inline0.js';
+import * as import1 from "./snippets/worxide-6b429b9ecf2d0121/inline1.js"
 
 
 /**
@@ -612,14 +612,14 @@ function __wbg_get_imports(memory) {
             const ret = Atomics.waitAsync;
             return ret;
         },
-        __wbg_worxide_app_js_path_14fa5d02e4f69949: function(arg0) {
+        __wbg_worxide_app_js_path_6ee1632e3c93f7e9: function(arg0) {
             const ret = worxide_app_js_path();
             var ptr1 = isLikeNone(ret) ? 0 : passStringToWasm0(ret, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
             var len1 = WASM_VECTOR_LEN;
             getDataViewMemory0().setInt32(arg0 + 4 * 1, len1, true);
             getDataViewMemory0().setInt32(arg0 + 4 * 0, ptr1, true);
         },
-        __wbg_worxide_glue_url_24e49845dec3cdd2: function(arg0, arg1, arg2) {
+        __wbg_worxide_glue_url_0be1873256d0fa1b: function(arg0, arg1, arg2) {
             var v0 = getCachedStringFromWasm0(arg1, arg2);
             const ret = worxide_glue_url(v0);
             const ptr2 = passStringToWasm0(ret, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
@@ -627,7 +627,7 @@ function __wbg_get_imports(memory) {
             getDataViewMemory0().setInt32(arg0 + 4 * 1, len2, true);
             getDataViewMemory0().setInt32(arg0 + 4 * 0, ptr2, true);
         },
-        __wbg_worxide_glue_url_from_path_99483da337e797cb: function(arg0, arg1, arg2) {
+        __wbg_worxide_glue_url_from_path_b818d594a96f0312: function(arg0, arg1, arg2) {
             var v0 = getCachedStringFromWasm0(arg1, arg2);
             const ret = worxide_glue_url_from_path(v0);
             const ptr2 = passStringToWasm0(ret, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
@@ -699,7 +699,7 @@ function __wbg_get_imports(memory) {
     return {
         __proto__: null,
         "./worxide_example_bg.js": import0,
-        "./snippets/worxide-83425a82d5813cec/inline1.js": import1,
+        "./snippets/worxide-6b429b9ecf2d0121/inline1.js": import1,
     };
 }
 
