@@ -7,10 +7,14 @@
 //! to be `pub`, so this can't be a private module; `#[doc(hidden)]` keeps it
 //! out of the generated docs. This is the same pattern serde, wasm-bindgen,
 //! and friends use for their macro-support modules.)
+//!
+//! The one exception is [`Worker`], the persistent worker handle, which IS
+//! public API and is re-exported from the crate root as `worxide::Worker`.
 
 use anyhow::{Context, Result, anyhow};
 use js_sys::{Promise, Reflect};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::fmt::Display;
 use std::future::Future;
 use std::pin::Pin;
@@ -20,7 +24,11 @@ use std::task::{Poll, RawWaker, RawWakerVTable, Waker};
 use wasm_bindgen::closure::Closure;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::JsFuture;
-use web_sys::{Blob, BlobPropertyBag, MessageEvent, Url, Worker, WorkerOptions, WorkerType};
+// `web_sys::Worker` is aliased to `WebWorker` so the public persistent handle
+// below can take the name `Worker` without colliding with the raw binding.
+use web_sys::{
+    Blob, BlobPropertyBag, MessageEvent, Url, Worker as WebWorker, WorkerOptions, WorkerType,
+};
 
 /// Worker bootstrap source, embedded at compile time. Turned into a Blob
 /// URL on first spawn so the worker has nothing to serve from disk.
@@ -106,6 +114,33 @@ fn cached_glue_url(crate_name: &str) -> String {
             })
             .clone()
     })
+}
+
+/// Resolve a glue URL for a persistent [`Worker`] — *without* the crate-name
+/// fallback the macros use. Prefers an already-cached URL (e.g. seeded by a
+/// prior spawn or worker on this thread), otherwise the consumer-set
+/// `globalThis.app_js_path`. Errors if neither is available, since a persistent
+/// `Worker` has no `CARGO_PKG_NAME` to fall back on — the glue lives in the
+/// app's wasm, which the page identifies via `app_js_path`.
+fn glue_url_via_app_path() -> Result<String> {
+    if let Some(url) = GLUE_URL.with(|c| c.borrow().clone()) {
+        return Ok(url);
+    }
+    let url = worxide_app_js_path()
+        .map(|p| worxide_glue_url_from_path(&p))
+        .context(
+            "worxide::Worker: no glue URL available — set `globalThis.app_js_path` in your \
+             page, or construct with `Worker::with_glue(path)`",
+        )?;
+    GLUE_URL.with(|c| *c.borrow_mut() = Some(url.clone()));
+    Ok(url)
+}
+
+/// Resolve an explicit glue path/URL against the document base and cache it.
+fn glue_url_explicit(path: &str) -> String {
+    let url = worxide_glue_url_from_path(path);
+    GLUE_URL.with(|c| *c.borrow_mut() = Some(url.clone()));
+    url
 }
 
 fn worker_url() -> Result<String> {
@@ -281,10 +316,10 @@ async fn construct_worker(
     module: JsValue,
     memory: JsValue,
     worker_url: String,
-) -> Result<(Worker, Promise)> {
+) -> Result<(WebWorker, Promise)> {
     let opts = WorkerOptions::new();
     opts.set_type(WorkerType::Module);
-    let worker = Worker::new_with_options(&worker_url, &opts)
+    let worker = WebWorker::new_with_options(&worker_url, &opts)
         .map_err(|e| js_err("Worker construction failed", e))?;
 
     let (promise, resolve, reject) = {
@@ -411,6 +446,332 @@ where
     // SAFETY: result_ptr came from box_result::<R> on the worker, and R: Send
     // so taking ownership of it on this thread is sound.
     Ok(unsafe { unbox_result::<R>(result_ptr as *mut ()) })
+}
+
+// ===========================================================================
+// Persistent worker handle
+// ===========================================================================
+//
+// `spawn!` / `spawn_blocking!` (via `run_inner` above) create a worker, run one
+// task, and terminate it. `Worker` instead boots a worker, attaches it to this
+// thread's shared memory once, and keeps it alive so many tasks run over the
+// same instance.
+//
+// Protocol (see worker.js):
+//   main -> worker  { type: "init",  module, memory, glue_url }
+//   worker -> main  { type: "ready" }
+//   main -> worker  { type: "call",  id, kind, ptr }
+//   worker -> main  { type: "result", id, result }            // success
+//   worker -> main  { type: "result", id, error }             // task threw
+//
+// The legacy one-shot message used by `run_inner` carries no `type`, so
+// worker.js keeps routing it through the old path untouched — `spawn!` users
+// see no change.
+//
+// Per-call error isolation: a Rust panic under `panic = "abort"` traps to JS as
+// a RuntimeError, which worker.js catches and reports as a `result` frame with
+// an `error`. That rejects the one call's future; the worker instance survives
+// and keeps serving. (The trapped task's box does not get its `Drop` run —
+// abort does not unwind — a bounded, per-panic leak.) A worker-level `error`
+// event, by contrast, means something we did not catch; the handle is then
+// marked dead and every in-flight call is rejected.
+//
+// Known cleanup gap (next hardening step): if a caller drops the future
+// returned by `run`/`run_blocking` before it resolves, the eventual result box
+// is not unboxed and leaks. Freeing it requires a type-erased deallocator per
+// call; not wired up yet.
+
+/// One in-flight call awaiting its `result` frame.
+struct Pending {
+    resolve: js_sys::Function,
+    reject: js_sys::Function,
+}
+
+/// Create a fresh JS `Promise`, returning it alongside its `resolve`/`reject`
+/// functions pulled out of the executor.
+fn new_promise() -> Result<(Promise, js_sys::Function, js_sys::Function)> {
+    let mut resolve_slot = None;
+    let mut reject_slot = None;
+    let promise = Promise::new(&mut |res, rej| {
+        resolve_slot = Some(res);
+        reject_slot = Some(rej);
+    });
+    Ok((
+        promise,
+        resolve_slot.context("Promise executor did not capture resolve")?,
+        reject_slot.context("Promise executor did not capture reject")?,
+    ))
+}
+
+/// Read the `type` discriminator off a worker frame, if present.
+fn frame_type(data: &JsValue) -> Option<String> {
+    Reflect::get(data, &JsValue::from_str("type"))
+        .ok()
+        .and_then(|v| v.as_string())
+}
+
+/// A persistent Web Worker attached to this thread's shared memory.
+///
+/// Construct it with [`Worker::new`] or [`Worker::with_glue`]. The worker
+/// imports the glue, runs `initSync` against this thread's shared memory once,
+/// then stays alive; run work with [`run_blocking`](Self::run_blocking) /
+/// [`run`](Self::run). Dropping the handle (or calling
+/// [`terminate`](Self::terminate)) stops it.
+pub struct Worker {
+    inner: WebWorker,
+    pending: Rc<RefCell<HashMap<u64, Pending>>>,
+    next_id: Rc<Cell<u64>>,
+    dead: Rc<Cell<bool>>,
+    // Retained so the listeners outlive `boot` and keep firing for the life of
+    // the handle. Dropping the handle drops these closures and terminates the
+    // worker (see `Drop`). NOT `forget()`-ed: a persistent worker must keep its
+    // handlers callable rather than leak them.
+    _on_message: Closure<dyn FnMut(MessageEvent)>,
+    _on_error: Closure<dyn FnMut(JsValue)>,
+}
+
+impl Worker {
+    /// Spawn a persistent worker, attach it to this thread's shared memory, and
+    /// resolve once it reports ready.
+    ///
+    /// Resolves the wasm glue via the consumer-set `globalThis.app_js_path`
+    /// (the path the app's `init` script uses). A library embedding worxide
+    /// relies on this, since the glue lives in the *app's* wasm, not the
+    /// library's. Errors if `app_js_path` is unset and nothing has seeded the
+    /// glue URL yet — use [`Worker::with_glue`] to pass it explicitly.
+    pub async fn new() -> Result<Self> {
+        Self::boot(glue_url_via_app_path()?).await
+    }
+
+    /// Like [`Worker::new`], but with an explicit glue path/URL (resolved
+    /// against the document base) instead of `globalThis.app_js_path`.
+    pub async fn with_glue(glue_path: &str) -> Result<Self> {
+        Self::boot(glue_url_explicit(glue_path)).await
+    }
+
+    async fn boot(glue_url: String) -> Result<Self> {
+        let worker_url = worker_url()?;
+        let module = wasm_bindgen::module();
+        let memory = wasm_bindgen::memory();
+
+        let opts = WorkerOptions::new();
+        opts.set_type(WorkerType::Module);
+        let inner = WebWorker::new_with_options(&worker_url, &opts)
+            .map_err(|e| js_err("Worker construction failed", e))?;
+
+        let pending: Rc<RefCell<HashMap<u64, Pending>>> = Rc::new(RefCell::new(HashMap::new()));
+        let next_id = Rc::new(Cell::new(0u64));
+        let dead = Rc::new(Cell::new(false));
+
+        // Resolves when the worker posts `{ type: "ready" }` after initSync.
+        let (ready, resolve_ready, reject_ready) = new_promise()?;
+
+        // One persistent listener handles the ready handshake and every later
+        // `result` frame, routing each result to its pending call by id.
+        let on_message = {
+            let pending = pending.clone();
+            let ready_resolve = resolve_ready.clone();
+            Closure::<dyn FnMut(MessageEvent)>::new(move |ev: MessageEvent| {
+                let data = ev.data();
+                match frame_type(&data).as_deref() {
+                    Some("ready") => {
+                        let _ = ready_resolve.call0(&JsValue::NULL);
+                    }
+                    Some("result") => {
+                        let Some(id) = Reflect::get(&data, &"id".into())
+                            .ok()
+                            .and_then(|v| v.as_f64())
+                            .map(|f| f as u64)
+                        else {
+                            return;
+                        };
+                        // If the id is unknown the call was already settled or
+                        // cancelled; drop the frame. (See the cleanup-gap note.)
+                        let Some(p) = pending.borrow_mut().remove(&id) else {
+                            return;
+                        };
+                        let err = Reflect::get(&data, &"error".into()).ok();
+                        match err {
+                            Some(e) if !e.is_undefined() && !e.is_null() => {
+                                let _ = p.reject.call1(&JsValue::NULL, &e);
+                            }
+                            _ => {
+                                let result = Reflect::get(&data, &"result".into())
+                                    .unwrap_or(JsValue::UNDEFINED);
+                                let _ = p.resolve.call1(&JsValue::NULL, &result);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            })
+        };
+        inner
+            .add_event_listener_with_callback("message", on_message.as_ref().unchecked_ref())
+            .map_err(|e| js_err("addEventListener(\"message\") failed", e))?;
+
+        // A worker-level `error` event — not a per-call failure (those arrive as
+        // `result` frames). Mark the handle dead, fail the boot handshake if
+        // still pending, and reject every in-flight call.
+        let on_error = {
+            let pending = pending.clone();
+            let dead = dead.clone();
+            let ready_reject = reject_ready.clone();
+            Closure::<dyn FnMut(JsValue)>::new(move |e: JsValue| {
+                dead.set(true);
+                let _ = ready_reject.call1(&JsValue::NULL, &e);
+                let drained: Vec<Pending> = pending.borrow_mut().drain().map(|(_, p)| p).collect();
+                for p in drained {
+                    let _ = p.reject.call1(&JsValue::NULL, &e);
+                }
+            })
+        };
+        inner
+            .add_event_listener_with_callback("error", on_error.as_ref().unchecked_ref())
+            .map_err(|e| js_err("addEventListener(\"error\") failed", e))?;
+
+        // Hand the worker the module, the shared memory, and the resolved glue
+        // URL. worker.js imports the glue, runs initSync ONCE, seeds the glue
+        // URL, and replies `{ type: "ready" }`.
+        let msg = js_sys::Object::new();
+        Reflect::set(&msg, &"type".into(), &"init".into())
+            .map_err(|e| js_err("set type on init", e))?;
+        Reflect::set(&msg, &"module".into(), &module)
+            .map_err(|e| js_err("set module on init", e))?;
+        Reflect::set(&msg, &"memory".into(), &memory)
+            .map_err(|e| js_err("set memory on init", e))?;
+        Reflect::set(&msg, &"glue_url".into(), &JsValue::from_str(&glue_url))
+            .map_err(|e| js_err("set glue_url on init", e))?;
+        inner
+            .post_message(&msg)
+            .map_err(|e| js_err("postMessage(init) failed", e))?;
+
+        JsFuture::from(ready)
+            .await
+            .map_err(|e| js_err("worker init failed", e))?;
+
+        Ok(Self {
+            inner,
+            pending,
+            next_id,
+            dead,
+            _on_message: on_message,
+            _on_error: on_error,
+        })
+    }
+
+    /// Run a synchronous closure on the worker and await its result. `R` is
+    /// inferred from the closure's return type. The closure (with its captured
+    /// arguments) and the result cross by pointer through shared memory.
+    pub async fn run_blocking<F, R>(&self, f: F) -> Result<R>
+    where
+        F: FnOnce() -> R + Send + 'static,
+        R: Send + 'static,
+    {
+        let task = WorkerTask::new(move || box_result(f()));
+        let bytes = self
+            .dispatch(task.into_ptr(), WorkerExecution::Sync)
+            .await?;
+        let result_ptr = ptr_from_js(&bytes)?;
+        // SAFETY: result_ptr came from box_result::<R> on the worker; R: Send.
+        Ok(unsafe { unbox_result::<R>(result_ptr as *mut ()) })
+    }
+
+    /// Run an asynchronous closure on the worker and await its result. The
+    /// worker drives the future to completion on its own event loop.
+    pub async fn run<F, Fut, R>(&self, f: F) -> Result<R>
+    where
+        F: FnOnce() -> Fut + Send + 'static,
+        Fut: Future<Output = R> + 'static,
+        R: Send + 'static,
+    {
+        let task = AsyncWorkerTask::new(move || async move { box_result(f().await) });
+        let bytes = self
+            .dispatch(task.into_ptr(), WorkerExecution::Async)
+            .await?;
+        let result_ptr = ptr_from_js(&bytes)?;
+        // SAFETY: result_ptr came from box_result::<R> on the worker; R: Send.
+        Ok(unsafe { unbox_result::<R>(result_ptr as *mut ()) })
+    }
+
+    /// Post a `call` frame for `task_ptr`, register a pending entry under a
+    /// fresh id, and await the matching `result` frame (the result-pointer
+    /// bytes, or an `Err` if the task threw or the worker died).
+    async fn dispatch(&self, task_ptr: usize, kind: WorkerExecution) -> Result<JsValue> {
+        if self.dead.get() {
+            // The worker will never take the task: reclaim it now.
+            // SAFETY: task_ptr came from {WorkerTask,AsyncWorkerTask}::into_ptr
+            // per `kind`, and has not been freed.
+            unsafe {
+                match kind {
+                    WorkerExecution::Sync => drop(WorkerTask::from_ptr(task_ptr)),
+                    WorkerExecution::Async => drop(AsyncWorkerTask::from_ptr(task_ptr)),
+                }
+            }
+            return Err(anyhow!(
+                "worxide::Worker is dead (an earlier worker error tore it down); construct a new one"
+            ));
+        }
+
+        let id = {
+            let n = self.next_id.get();
+            self.next_id.set(n.wrapping_add(1));
+            n
+        };
+        let (promise, resolve, reject) = new_promise()?;
+        self.pending
+            .borrow_mut()
+            .insert(id, Pending { resolve, reject });
+
+        let msg = js_sys::Object::new();
+        Reflect::set(&msg, &"type".into(), &"call".into())
+            .map_err(|e| js_err("set type on call", e))?;
+        Reflect::set(&msg, &"id".into(), &JsValue::from_f64(id as f64))
+            .map_err(|e| js_err("set id on call", e))?;
+        Reflect::set(&msg, &"kind".into(), &JsValue::from_str(&kind.to_string()))
+            .map_err(|e| js_err("set kind on call", e))?;
+        Reflect::set(&msg, &"ptr".into(), &ptr_to_js(task_ptr))
+            .map_err(|e| js_err("set ptr on call", e))?;
+
+        if let Err(e) = self.inner.post_message(&msg) {
+            // Never reached the worker: drop the pending entry and reclaim the
+            // task box (the worker never took ownership).
+            self.pending.borrow_mut().remove(&id);
+            // SAFETY: as above; task_ptr not yet handed off.
+            unsafe {
+                match kind {
+                    WorkerExecution::Sync => drop(WorkerTask::from_ptr(task_ptr)),
+                    WorkerExecution::Async => drop(AsyncWorkerTask::from_ptr(task_ptr)),
+                }
+            }
+            return Err(js_err("postMessage(call) failed", e));
+        }
+
+        JsFuture::from(promise)
+            .await
+            .map_err(|e| js_err("worker task failed", e))
+    }
+
+    /// The underlying worker.
+    ///
+    /// Exposed so a consumer can `post_message_with_transfer` (e.g. to hand the
+    /// worker an `OffscreenCanvas`) and attach its own `addEventListener`
+    /// side-channels alongside worxide's listener — that traffic does not pass
+    /// through worxide's own dispatch.
+    pub fn raw(&self) -> &WebWorker {
+        &self.inner
+    }
+
+    /// Terminate the worker immediately. Idempotent; also runs on drop.
+    pub fn terminate(&self) {
+        self.inner.terminate();
+    }
+}
+
+impl Drop for Worker {
+    fn drop(&mut self) {
+        self.inner.terminate();
+    }
 }
 
 // Drives a future to completion on the worker's own event loop, returning

@@ -1,6 +1,6 @@
 [package]
 name = "worxide"
-version = "0.0.4"
+version = "0.0.5"
 edition = "2024"
 
 description = "Fast WASM Workers"
@@ -30,4 +30,4 @@ anyhow = "1.0.102"
 js-sys = "0.3.99"
 wasm-bindgen = "0.2.122"
 wasm-bindgen-futures = "0.4.72"
-web-sys = { version = "0.3.99", features = [ "Blob", "BlobPropertyBag", "MessageEvent", "Url", "Worker", "WorkerGlobalScope", "WorkerOptions", "WorkerType"] }
+web-sys = { version = "0.3.99", features = [ "Blob", "BlobPropertyBag", "EventTarget", "MessageEvent", "Url", "Worker", "WorkerGlobalScope", "WorkerOptions", "WorkerType" ] }

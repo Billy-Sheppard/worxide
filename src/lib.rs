@@ -5,6 +5,31 @@
 #[doc(hidden)]
 pub mod private;
 
+/// A persistent Web Worker attached to this thread's shared memory.
+///
+/// Where [`spawn!`] / [`spawn_blocking!`] create a worker, run one task, and
+/// terminate it, a `Worker` is constructed once, attaches to this thread's
+/// shared memory, and stays alive so subsequent calls reuse the same instance.
+/// Use it when the worker must hold state across calls or receive a transferred
+/// object (e.g. an `OffscreenCanvas`); reach for the macros for one-off jobs.
+///
+/// Construct it with [`Worker::new`] (which resolves the wasm glue via the
+/// consumer-set `globalThis.app_js_path`) or [`Worker::with_glue`] (an explicit
+/// path/URL). There is no `spawn_persistent!` macro: once you hold a handle,
+/// run work with the plain methods [`Worker::run_blocking`] (sync, CPU-bound)
+/// and [`Worker::run`] (async). Arguments and results cross by pointer through
+/// shared memory — no serialization, no copy.
+///
+/// Dropping the handle terminates the worker.
+///
+/// ```ignore
+/// let w = worxide::Worker::new().await?;            // glue via globalThis.app_js_path
+/// let n = w.run_blocking(move || crunch(data)).await?;
+/// let raw: &web_sys::Worker = w.raw();              // for transfers + side-channels
+/// w.terminate();
+/// ```
+pub use private::Worker;
+
 /// Returns `true` if the current thread is a Web Worker, `false` if it is the
 /// main (window) thread.
 ///
