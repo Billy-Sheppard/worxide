@@ -1,6 +1,6 @@
 # worxide
 
-*This library was written with the help of Claude, it has been reviewed by a human and both this README and lib.rs has been rewritten by a human.*
+*This library was written with the help of Claude, it has been reviewed by me and the example, README and lib.rs have been heavily re-written by me.*
 
 [![crates.io](https://img.shields.io/crates/v/worxide.svg)](https://crates.io/crates/worxide)
 [![docs.rs](https://docs.rs/worxide/badge.svg)](https://docs.rs/worxide)
