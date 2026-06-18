@@ -5,39 +5,12 @@
 #[doc(hidden)]
 pub mod private;
 
-/// A persistent Web Worker attached to this thread's shared memory.
-///
-/// Where [`spawn!`] / [`spawn_blocking!`] create a worker, run one task, and
-/// terminate it, a `Worker` is constructed once, attaches to this thread's
-/// shared memory, and stays alive so subsequent calls reuse the same instance.
-/// Use it when the worker must hold state across calls or receive a transferred
-/// object (e.g. an `OffscreenCanvas`); reach for the macros for one-off jobs.
-///
-/// Construct it with [`Worker::new`] (which resolves the wasm glue via the
-/// consumer-set `globalThis.app_js_path`) or [`Worker::with_glue`] (an explicit
-/// path/URL). There is no `spawn_persistent!` macro: once you hold a handle,
-/// run work with the plain methods [`Worker::run_blocking`] (sync, CPU-bound)
-/// and [`Worker::run`] (async). Arguments and results cross by pointer through
-/// shared memory — no serialization, no copy.
-///
-/// Dropping the handle terminates the worker.
-///
-/// ```ignore
-/// let w = worxide::Worker::new().await?;            // glue via globalThis.app_js_path
-/// let n = w.run_blocking(move || crunch(data)).await?;
-/// let raw: &web_sys::Worker = w.raw();              // for transfers + side-channels
-/// w.terminate();
-/// ```
 pub use private::Worker;
 
-/// Returns `true` if the current thread is a Web Worker, `false` if it is the
-/// main (window) thread.
+/// Detects if the current thread is a Web Worker
 ///
-/// This is useful for guarding main-thread-only work (DOM access, UI setup),
-/// since the wasm module is instantiated on every worker too. Prefer this over
-/// ad-hoc checks like `web_sys::window().is_none()`: it positively identifies a
-/// worker by testing the global scope against `WorkerGlobalScope`, rather than
-/// inferring "worker" from the absence of a window.
+/// This is useful for guarding main-thread-only work (DOM access, UI setup, etc),
+///  since the wasm module is instantiated on every worker too.
 ///
 /// ```ignore
 /// #[wasm_bindgen]
@@ -49,16 +22,14 @@ pub use private::Worker;
 pub fn is_worker() -> bool {
     use wasm_bindgen::{JsCast, JsValue};
     let global: JsValue = js_sys::global().into();
-    // `WorkerGlobalScope` exists only inside workers. If the global is an
-    // instance of it, we're on a worker thread.
+    // `WorkerGlobalScope` exists only inside workers. If the global is an instance of it, we're on a worker thread.
     global.is_instance_of::<web_sys::WorkerGlobalScope>()
 }
 
 /// Spawn a synchronous function on a Web Worker and await its result.
 ///
-/// The worker runs `func(args...)` on its own thread; the call site gets back
-/// a future of `anyhow::Result<R>`, with `R` inferred from `func`'s return
-/// type. Use this for CPU-bound work that would otherwise block the caller.
+/// The worker runs `func(args...)` on its own thread; the call site gets back a future of `anyhow::Result<R>`,
+/// with `R` inferred from `func`'s return type. Use this for CPU-bound work that would otherwise block the caller.
 ///
 /// ```ignore
 /// fn crunch(n: u32) -> u64 { (n as u64) * 2 }
@@ -77,11 +48,13 @@ macro_rules! spawn_blocking {
 /// Spawn an asynchronous function on a Web Worker and await its result.
 ///
 /// Like [`spawn_blocking!`], but for `async fn` / future-returning functions.
-/// The worker drives the future to completion on its own event loop.
+/// The worker drives the future to completion on its own event loop (a JS Promise).
 ///
 /// ```ignore
-/// async fn crunch(n: u32) -> u64 { (n as u64) * 2 }
-/// let result = worxide::spawn!(crunch, 42).await?;
+/// async fn get_image(url: &str) -> anyhow::Result<String> { reqwest::get(url).text().await? }
+/// let result = worxide::spawn!(get_image, "https://example.com").await; // this returns anyhow::Result<anyhow::Result<String>>
+/// let result = worxide::spawn!(get_image, "https://example.com").await?; // this returns anyhow::Result<String>
+/// let result = worxide::spawn!(get_image, "https://example.com").await.flatten()?; // this returns String
 /// ```
 #[macro_export]
 macro_rules! spawn {

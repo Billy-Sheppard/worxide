@@ -26,7 +26,10 @@ use {
     },
     wasm_bindgen::{closure::Closure, prelude::*},
     wasm_bindgen_futures::JsFuture,
-    web_sys::{Blob, BlobPropertyBag, MessageEvent, Url, Worker as WebWorker, WorkerOptions, WorkerType},
+    web_sys::{
+        Blob, BlobPropertyBag, MessageChannel, MessageEvent, MessagePort, Url, Worker as WebWorker, WorkerOptions,
+        WorkerType,
+    },
 };
 
 /// Worker bootstrap source, embedded at compile time. Turned into a Blob
@@ -238,7 +241,7 @@ fn ptr_from_js(v: &JsValue) -> Result<usize> {
 
 /// Encode a 64-bit call id as little-endian bytes (a fresh `Uint8Array`).
 ///
-/// Sent verbatim by worker.js in the matching `result` frame. Bytes rather than
+/// Sent verbatim by worker.js in the matching `result` envelope. Bytes rather than
 /// an `f64` so the id round-trips losslessly past 2^53 — a collision between two
 /// in-flight ids would route a result to the wrong call and unbox it as the
 /// wrong type, so the transport has to be exact.
@@ -253,9 +256,11 @@ fn id_from_js(v: &JsValue) -> Option<u64> {
 
 /// Decode a pointer handed to a worker entry point as `&[u8]`.
 ///
-/// Returns `Err` (rather than trapping) on a wrong-length payload: the worker's
-/// message channel is shared with consumers via [`Worker::raw`], so a stray
-/// frame must degrade to a rejected call, not abort the whole shared instance.
+/// Returns `Err` (surfaced to JS, caught by worker.js as a per-call error
+/// envelope) rather than trapping on a wrong-length payload. With the control
+/// channel now private this is unreachable from a consumer, but failing one call
+/// instead of aborting the whole shared instance is the right behaviour for any
+/// stray or buggy envelope regardless.
 fn decode_task_ptr(bytes: &[u8]) -> Result<usize, JsValue> {
     let buf: [u8; PTR_LEN] =
         bytes.try_into().map_err(|_| JsValue::from_str("worxide: task pointer payload had the wrong length"))?;
@@ -448,28 +453,35 @@ where
 // same instance.
 //
 // Protocol (see worker.js):
-//   main -> worker  { type: "init",  module, memory, glue_url }
-//   worker -> main  { type: "ready" }
-//   main -> worker  { type: "call",  id, kind, ptr }
-//   worker -> main  { type: "result", id, result }            // success
-//   worker -> main  { type: "result", id, error }             // task threw
+//   main -> worker  { type: "init",  module, memory, glue_url } + [control port]
+//   worker -> port  { type: "ready" }
+//   main -> port    { type: "call",  id, kind, ptr }
+//   worker -> port  { type: "result", id, result }            // success
+//   worker -> port  { type: "result", id, error }             // task threw
 //
-// The one-shot message used by `run_inner` carries no `type`, so
-// worker.js keeps routing it through the old path untouched — `spawn!` users
-// see no change.
+// Only the one `init` envelope rides the worker's default postMessage channel,
+// and it transfers a `MessageChannel` port. Everything after — `ready`, every
+// `call`, every `result` — runs over that private port. The worker's default
+// channel is thereby left entirely to the consumer (see `Worker::raw`): their
+// traffic physically cannot reach worxide's dispatch, and a `call` they forge on
+// the default channel goes nowhere. That is what makes `raw()` safe.
+//
+// The one-shot envelope used by `run_inner` carries no `type` and rides the
+// default channel (one-shot workers are never shared, so there is no port and no
+// `raw()`); worker.js keeps routing it through the old path untouched.
 //
 // Per-call error isolation: a Rust panic under `panic = "abort"` traps to JS as
-// a RuntimeError, which worker.js catches and reports as a `result` frame with
+// a RuntimeError, which worker.js catches and reports as a `result` envelope with
 // an `error`. That rejects the one call's future; the worker instance survives
 // and keeps serving. (The trapped task's box does not get its `Drop` run —
 // abort does not unwind — a bounded, per-panic leak.) A worker-level `error`
 // event, by contrast, means something we did not catch; the handle is then
 // marked dead and every in-flight call is rejected.
 //
-// Known cleanup gap (next hardening step): if a caller drops the future
-// returned by `run`/`run_blocking` before it resolves, the eventual result box
-// is not unboxed and leaks. Freeing it requires a type-erased deallocator per
-// call; not wired up yet.
+// Remaining bounded leaks (both tied to worker lifetime, freed at teardown):
+// the trapped task's box on a per-panic abort (above), and a task box still
+// in flight if the worker dies mid-call — the worker owned it and never
+// replied. A dropped result future no longer leaks: see `AbandonGuard`.
 
 /// Where a call's outcome lands. `on_message` deposits into the shared slot and
 /// fires the call's signal; the awaiting `dispatch` future takes it on resume.
@@ -489,7 +501,7 @@ enum Slot {
 }
 
 /// One in-flight call. Lives in `Worker::pending` keyed by id until its `result`
-/// frame arrives (or the worker dies).
+/// envelope arrives (or the worker dies).
 struct Pending {
     /// Shared with the awaiting `dispatch` future and its [`AbandonGuard`].
     slot: Rc<RefCell<Slot>>,
@@ -506,7 +518,7 @@ struct Pending {
 /// leak:
 ///   * one that already landed (`Slot::Ok`) is freed here, and
 ///   * one still in flight is handled by flipping the slot to `Abandoned`, so
-///     the late `result` frame is freed by `on_message` instead of delivered.
+///     the late `result` envelope is freed by `on_message` instead of delivered.
 ///
 /// Disarmed once `dispatch` has taken the outcome.
 struct AbandonGuard {
@@ -525,7 +537,10 @@ impl Drop for AbandonGuard {
             return;
         }
         // Awaiter dropped before taking its outcome. Free a result that already
-        // landed; otherwise mark the slot so a late frame is reaped downstream.
+        // landed; otherwise mark the slot so a late envelope is reaped downstream.
+        // SAFETY: a `Slot::Ok` ptr came from `box_result::<R>` on the worker and
+        // `free_result` is that same `R`'s deallocator; nothing else has taken it
+        // (the slot was not `Done`).
         if let Slot::Ok(ptr) = std::mem::replace(&mut *self.slot.borrow_mut(), Slot::Abandoned) {
             unsafe { (self.free_result)(ptr) }
         }
@@ -548,20 +563,32 @@ fn new_promise() -> Result<(Promise, js_sys::Function, js_sys::Function)> {
     ))
 }
 
-/// Read the `type` discriminator off a worker frame, if present.
-fn frame_type(data: &JsValue) -> Option<String> {
+/// Read the `type` discriminator off a worker envelope, if present.
+fn envelope_type(data: &JsValue) -> Option<String> {
     Reflect::get(data, &JsValue::from_str("type")).ok().and_then(|v| v.as_string())
 }
 
 /// A persistent Web Worker attached to this thread's shared memory.
 ///
-/// Construct it with [`Worker::new`] or [`Worker::with_glue`]. The worker
-/// imports the glue, runs `initSync` against this thread's shared memory once,
-/// then stays alive; run work with [`run_blocking`](Self::run_blocking) /
-/// [`run`](Self::run). Dropping the handle (or calling
-/// [`terminate`](Self::terminate)) stops it.
+/// Construct it with [`Worker::new`]
+/// (which resolves the wasm glue via the consumer-set `globalThis.app_js_path`) or [`Worker::with_glue`] (an explicit path/URL).
+/// There is no `spawn_persistent!` macro: once you hold a handle, run work with the plain methods [`Worker::run_blocking`] (sync, CPU-bound)
+/// and [`Worker::run`] (async). Arguments and results cross by pointer through shared memory.
+///
+/// Dropping the handle terminates the worker.
+///
+/// ```ignore
+/// let w = worxide::Worker::new().await?;              // glue via globalThis.app_js_path
+/// let n = w.run_blocking(move || crunch(data)).await?;
+///
+/// w.terminate();
+/// ```
 pub struct Worker {
     inner: WebWorker,
+    // Our end of the private control channel; the other end was transferred to
+    // the worker at boot. Every `call` goes out here and every `ready`/`result`
+    // comes back here, isolated from the consumer's use of `inner`.
+    port: MessagePort,
     pending: Rc<RefCell<HashMap<u64, Pending>>>,
     next_id: Rc<Cell<u64>>,
     dead: Rc<Cell<bool>>,
@@ -597,6 +624,15 @@ impl Worker {
         opts.set_type(WorkerType::Module);
         let inner = WebWorker::new_with_options(&worker_url, &opts).map_err(|e| js_err("Worker construction failed", e))?;
 
+        // Private control channel. `port1` stays here and carries every
+        // ready/call/result; `port2` is transferred to the worker in the `init`
+        // envelope below. After that handover, the worker's *default* channel
+        // belongs entirely to the consumer — worxide never reads it again — so
+        // nothing a consumer posts via `raw()` can reach this dispatch.
+        let channel = MessageChannel::new().map_err(|e| js_err("MessageChannel construction failed", e))?;
+        let port = channel.port1();
+        let worker_port = channel.port2();
+
         let pending: Rc<RefCell<HashMap<u64, Pending>>> = Rc::new(RefCell::new(HashMap::new()));
         let next_id = Rc::new(Cell::new(0u64));
         let dead = Rc::new(Cell::new(false));
@@ -604,14 +640,15 @@ impl Worker {
         // Resolves when the worker posts `{ type: "ready" }` after initSync.
         let (ready, resolve_ready, reject_ready) = new_promise()?;
 
-        // One persistent listener handles the ready handshake and every later
-        // `result` frame, routing each result to its pending call by id.
+        // One persistent listener on the control port handles the ready
+        // handshake and every later `result` envelope, routing each result to
+        // its pending call by id.
         let on_message = {
             let pending = pending.clone();
             let ready_resolve = resolve_ready.clone();
             Closure::<dyn FnMut(MessageEvent)>::new(move |ev: MessageEvent| {
                 let data = ev.data();
-                match frame_type(&data).as_deref() {
+                match envelope_type(&data).as_deref() {
                     Some("ready") => {
                         ready_resolve.call0(&JsValue::NULL).ok();
                     }
@@ -619,12 +656,12 @@ impl Worker {
                         let Some(id) = Reflect::get(&data, &"id".into()).ok().and_then(|v| id_from_js(&v)) else {
                             return;
                         };
-                        // Unknown id: the call already settled, or it's a stray
-                        // frame on the shared channel. Drop it.
+                        // Unknown id: the call already settled (a late or
+                        // duplicate result). Drop it.
                         let Some(p) = pending.borrow_mut().remove(&id) else {
                             return;
                         };
-                        // Decode the frame into an outcome before touching the
+                        // Decode the envelope into an outcome before touching the
                         // slot, so the abandoned branch can free or the live
                         // branch can deposit.
                         let err = Reflect::get(&data, &"error".into()).ok();
@@ -660,12 +697,15 @@ impl Worker {
                 }
             })
         };
-        inner
-            .add_event_listener_with_callback("message", on_message.as_ref().unchecked_ref())
-            .map_err(|e| js_err("addEventListener(\"message\") failed", e))?;
+        port.add_event_listener_with_callback("message", on_message.as_ref().unchecked_ref())
+            .map_err(|e| js_err("addEventListener(\"message\") on control port failed", e))?;
+        // Required when listening via addEventListener (unlike `onmessage=`, which
+        // auto-starts). Buffered envelopes — e.g. an early `ready` — are delivered
+        // once started, so this is race-free even though we start before `init`.
+        port.start();
 
         // A worker-level `error` event — not a per-call failure (those arrive as
-        // `result` frames). Mark the handle dead, fail the boot handshake if
+        // `result` envelopes). Mark the handle dead, fail the boot handshake if
         // still pending, and reject every in-flight call.
         let on_error = {
             let pending = pending.clone();
@@ -692,20 +732,24 @@ impl Worker {
             .add_event_listener_with_callback("error", on_error.as_ref().unchecked_ref())
             .map_err(|e| js_err("addEventListener(\"error\") failed", e))?;
 
-        // Hand the worker the module, the shared memory, and the resolved glue
-        // URL. worker.js imports the glue, runs initSync ONCE, seeds the glue
-        // URL, and replies `{ type: "ready" }`.
+        // Hand the worker the module, the shared memory, the resolved glue URL,
+        // and — transferred — its end of the control port. worker.js imports the
+        // glue, runs initSync ONCE, adopts the port, seeds the glue URL, and
+        // replies `{ type: "ready" }` over the port. This is the only envelope on
+        // the default channel; everything else is on the port.
         let msg = js_sys::Object::new();
         Reflect::set(&msg, &"type".into(), &"init".into()).map_err(|e| js_err("set type on init", e))?;
         Reflect::set(&msg, &"module".into(), &module).map_err(|e| js_err("set module on init", e))?;
         Reflect::set(&msg, &"memory".into(), &memory).map_err(|e| js_err("set memory on init", e))?;
         Reflect::set(&msg, &"glue_url".into(), &JsValue::from_str(&glue_url))
             .map_err(|e| js_err("set glue_url on init", e))?;
-        inner.post_message(&msg).map_err(|e| js_err("postMessage(init) failed", e))?;
+        // Transfer `worker_port`: it arrives in the worker as `event.ports[0]`.
+        let transfer = js_sys::Array::of1(&worker_port);
+        inner.post_message_with_transfer(&msg, &transfer).map_err(|e| js_err("postMessage(init) failed", e))?;
 
         JsFuture::from(ready).await.map_err(|e| js_err("worker init failed", e))?;
 
-        Ok(Self { inner, pending, next_id, dead, _on_message: on_message, _on_error: on_error })
+        Ok(Self { inner, port, pending, next_id, dead, _on_message: on_message, _on_error: on_error })
     }
 
     /// Run a synchronous closure on the worker and await its result. `R` is
@@ -736,7 +780,7 @@ impl Worker {
         Ok(unsafe { unbox_result::<R>(result_ptr as *mut ()) })
     }
 
-    /// Post a `call` frame for `task_ptr`, register a pending entry under a
+    /// Post a `call` envelope for `task_ptr`, register a pending entry under a
     /// fresh id, and await its outcome — the result pointer, or an `Err` if the
     /// task threw or the worker died.
     ///
@@ -780,7 +824,7 @@ impl Worker {
             .map_err(|e| js_err("set kind on call", e))?;
         Reflect::set(&msg, &"ptr".into(), &ptr_to_js(task_ptr)).map_err(|e| js_err("set ptr on call", e))?;
 
-        if let Err(e) = self.inner.post_message(&msg) {
+        if let Err(e) = self.port.post_message(&msg) {
             // Never reached the worker: drop the pending entry and reclaim the
             // task box (the worker never took ownership). Nothing was deposited,
             // so disarm — there is no result to reap.
@@ -816,27 +860,26 @@ impl Worker {
     ///
     /// Exposed so a consumer can `post_message_with_transfer` (e.g. to hand the
     /// worker an `OffscreenCanvas`) and attach its own `addEventListener`
-    /// side-channels alongside worxide's listener — that traffic does not pass
-    /// through worxide's own dispatch.
+    /// side-channels alongside worxide's.
     ///
-    /// # Invariant
-    ///
-    /// worxide and your side-channel share one `postMessage` channel, and the
-    /// worker routes on a `type` discriminator. Do **not** post frames whose
-    /// `type` is `"init"` or `"call"`, and do not post an untyped frame carrying
-    /// a `glue_url` field: those are worxide's own protocol. A `call` frame in
-    /// particular hands the worker a raw pointer that it reconstructs into a
-    /// `Box`, so a forged or malformed one is undefined behaviour, not a caught
-    /// error. Keep your messages to your own `type` values and you will never
-    /// collide.
-    pub fn raw(&self) -> &WebWorker { &self.inner }
+    /// This is safe to use freely: worxide's call/result protocol runs over a
+    /// private [`MessagePort`] the worker adopted at boot, so the worker's
+    /// default message channel — the one reached through here — carries none of
+    /// it. Your `postMessage` traffic cannot collide with worxide's dispatch (a
+    /// forged `call` on this channel goes nowhere), and worxide never reads this
+    /// channel after init, so it will not touch your envelopes. Receive your own
+    /// envelopes on the worker side with your own `self.addEventListener`.
+    pub fn worker_handle(&self) -> &WebWorker { &self.inner }
 
     /// Terminate the worker immediately. Idempotent; also runs on drop.
-    pub fn terminate(&self) { self.inner.terminate(); }
+    pub fn terminate(&self) {
+        self.port.close();
+        self.inner.terminate();
+    }
 }
 
 impl Drop for Worker {
-    fn drop(&mut self) { self.inner.terminate(); }
+    fn drop(&mut self) { self.terminate(); }
 }
 
 // Drives a future to completion on the worker's own event loop, returning
@@ -964,7 +1007,7 @@ extern "C" {
 pub fn __worxide_seed_glue_url(url: String) { GLUE_URL.with(|cell| *cell.borrow_mut() = Some(url)); }
 
 /// Worker thread entry point for sync tasks. Returns the result pointer bytes,
-/// or `Err` (thrown to JS and caught by worker.js as a per-call error frame) if
+/// or `Err` (thrown to JS and caught by worker.js as a per-call error envelope) if
 /// the payload is malformed — see [`decode_task_ptr`].
 #[wasm_bindgen]
 pub fn __worxide_worker_entry(ptr_bytes: &[u8]) -> Result<Vec<u8>, JsValue> {
@@ -987,14 +1030,13 @@ pub fn __worxide_worker_entry(ptr_bytes: &[u8]) -> Result<Vec<u8>, JsValue> {
 /// on that same event loop, so progress happens without any cross-thread
 /// futex coordination.
 #[wasm_bindgen]
-pub fn __worxide_worker_entry_async(ptr_bytes: &[u8]) -> js_sys::Promise {
-    let task_ptr = match decode_task_ptr(ptr_bytes) {
-        Ok(p) => p,
-        // Reject (rather than trap) on a malformed payload, for the same
-        // shared-channel reason as the sync entry.
-        Err(e) => return js_sys::Promise::reject(&e),
-    };
+pub fn __worxide_worker_entry_async(ptr_bytes: &[u8]) -> Result<js_sys::Promise, JsValue> {
+    // Throw synchronously on a malformed payload (caught by worker.js as a
+    // per-call error envelope). Returning `Result` rather than calling
+    // `Promise::reject` keeps the error path on the existing `__wbindgen_throw`
+    // import instead of pulling in a fresh glue shim.
+    let task_ptr = decode_task_ptr(ptr_bytes)?;
     // SAFETY: pointer came from AsyncWorkerTask::into_ptr on the main thread.
     let task = unsafe { AsyncWorkerTask::from_ptr(task_ptr) };
-    drive_to_promise(task.run())
+    Ok(drive_to_promise(task.run()))
 }
