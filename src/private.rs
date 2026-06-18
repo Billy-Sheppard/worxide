@@ -11,23 +11,22 @@
 //! The one exception is [`Worker`], the persistent worker handle, which IS
 //! public API and is re-exported from the crate root as `worxide::Worker`.
 
-use anyhow::{Context, Result, anyhow};
-use js_sys::{Promise, Reflect};
-use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
-use std::fmt::Display;
-use std::future::Future;
-use std::pin::Pin;
-use std::rc::Rc;
-use std::str::FromStr;
-use std::task::{Poll, RawWaker, RawWakerVTable, Waker};
-use wasm_bindgen::closure::Closure;
-use wasm_bindgen::prelude::*;
-use wasm_bindgen_futures::JsFuture;
-// `web_sys::Worker` is aliased to `WebWorker` so the public persistent handle
-// below can take the name `Worker` without colliding with the raw binding.
-use web_sys::{
-    Blob, BlobPropertyBag, MessageEvent, Url, Worker as WebWorker, WorkerOptions, WorkerType,
+use {
+    anyhow::{Context, Result, anyhow},
+    js_sys::{Promise, Reflect},
+    std::{
+        cell::{Cell, RefCell},
+        collections::HashMap,
+        fmt::Display,
+        future::Future,
+        pin::Pin,
+        rc::Rc,
+        str::FromStr,
+        task::{Poll, RawWaker, RawWakerVTable, Waker},
+    },
+    wasm_bindgen::{closure::Closure, prelude::*},
+    wasm_bindgen_futures::JsFuture,
+    web_sys::{Blob, BlobPropertyBag, MessageEvent, Url, Worker as WebWorker, WorkerOptions, WorkerType},
 };
 
 /// Worker bootstrap source, embedded at compile time. Turned into a Blob
@@ -126,12 +125,10 @@ fn glue_url_via_app_path() -> Result<String> {
     if let Some(url) = GLUE_URL.with(|c| c.borrow().clone()) {
         return Ok(url);
     }
-    let url = worxide_app_js_path()
-        .map(|p| worxide_glue_url_from_path(&p))
-        .context(
-            "worxide::Worker: no glue URL available — set `globalThis.app_js_path` in your \
-             page, or construct with `Worker::with_glue(path)`",
-        )?;
+    let url = worxide_app_js_path().map(|p| worxide_glue_url_from_path(&p)).context(
+        "worxide::Worker: no glue URL available — set `globalThis.app_js_path` in your page, or construct with \
+         `Worker::with_glue(path)`",
+    )?;
     GLUE_URL.with(|c| *c.borrow_mut() = Some(url.clone()));
     Ok(url)
 }
@@ -149,8 +146,7 @@ fn worker_url() -> Result<String> {
     array.push(&JsValue::from_str(WORKER_JS));
     let opts = BlobPropertyBag::new();
     opts.set_type("application/javascript");
-    let blob = Blob::new_with_str_sequence_and_options(&array, &opts)
-        .map_err(|e| js_err("Blob construction failed", e))?;
+    let blob = Blob::new_with_str_sequence_and_options(&array, &opts).map_err(|e| js_err("Blob construction failed", e))?;
     Url::create_object_url_with_blob(&blob).map_err(|e| js_err("URL.createObjectURL failed", e))
 }
 
@@ -166,17 +162,13 @@ impl WorkerTask {
     {
         Self { func: Box::new(f) }
     }
-    pub fn run(self) -> *mut () {
-        (self.func)()
-    }
-    pub fn into_ptr(self) -> usize {
-        Box::into_raw(Box::new(self)) as usize
-    }
+
+    pub fn run(self) -> *mut () { (self.func)() }
+
+    pub fn into_ptr(self) -> usize { Box::into_raw(Box::new(self)) as usize }
 
     /// # Safety: ptr must come from `into_ptr` and not be freed yet.
-    pub unsafe fn from_ptr(ptr: usize) -> Box<WorkerTask> {
-        unsafe { Box::from_raw(ptr as *mut WorkerTask) }
-    }
+    pub unsafe fn from_ptr(ptr: usize) -> Box<WorkerTask> { unsafe { Box::from_raw(ptr as *mut WorkerTask) } }
 }
 
 /// Async task: closure returns a future that resolves to the boxed result.
@@ -194,30 +186,21 @@ impl AsyncWorkerTask {
         F: FnOnce() -> Fut + Send + 'static,
         Fut: Future<Output = *mut ()> + 'static,
     {
-        Self {
-            func: Box::new(move || Box::pin(f())),
-        }
+        Self { func: Box::new(move || Box::pin(f())) }
     }
-    pub fn run(self) -> Pin<Box<dyn Future<Output = *mut ()>>> {
-        (self.func)()
-    }
-    pub fn into_ptr(self) -> usize {
-        Box::into_raw(Box::new(self)) as usize
-    }
+
+    pub fn run(self) -> Pin<Box<dyn Future<Output = *mut ()>>> { (self.func)() }
+
+    pub fn into_ptr(self) -> usize { Box::into_raw(Box::new(self)) as usize }
+
     /// # Safety: ptr must come from `into_ptr` and not be freed yet.
-    pub unsafe fn from_ptr(ptr: usize) -> Box<AsyncWorkerTask> {
-        unsafe { Box::from_raw(ptr as *mut AsyncWorkerTask) }
-    }
+    pub unsafe fn from_ptr(ptr: usize) -> Box<AsyncWorkerTask> { unsafe { Box::from_raw(ptr as *mut AsyncWorkerTask) } }
 }
 
-pub fn box_result<T: Send + 'static>(value: T) -> *mut () {
-    Box::into_raw(Box::new(value)) as *mut ()
-}
+pub fn box_result<T: Send + 'static>(value: T) -> *mut () { Box::into_raw(Box::new(value)) as *mut () }
 
 /// # Safety: ptr must come from `box_result::<T>` and not be freed yet.
-pub unsafe fn unbox_result<T: Send + 'static>(ptr: *mut ()) -> T {
-    unsafe { *Box::from_raw(ptr as *mut T) }
-}
+pub unsafe fn unbox_result<T: Send + 'static>(ptr: *mut ()) -> T { unsafe { *Box::from_raw(ptr as *mut T) } }
 
 // A pointer crosses the `postMessage` boundary — and resolves the async
 // worker's Promise — as a little-endian byte payload, never as an `f64`. The
@@ -236,24 +219,18 @@ fn ptr_to_js(ptr: usize) -> JsValue {
 
 /// Decode a pointer previously produced by [`ptr_to_js`].
 fn ptr_from_js(v: &JsValue) -> Result<usize> {
-    let arr = v
-        .dyn_ref::<js_sys::Uint8Array>()
-        .context("worker reply was not a Uint8Array")?;
+    let arr = v.dyn_ref::<js_sys::Uint8Array>().context("worker reply was not a Uint8Array")?;
     let bytes = arr.to_vec();
-    let buf: [u8; PTR_LEN] = bytes.as_slice().try_into().map_err(|_| {
-        anyhow!(
-            "worker reply was {} bytes, expected a {PTR_LEN}-byte pointer",
-            bytes.len()
-        )
-    })?;
+    let buf: [u8; PTR_LEN] = bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| anyhow!("worker reply was {} bytes, expected a {PTR_LEN}-byte pointer", bytes.len()))?;
     Ok(usize::from_le_bytes(buf))
 }
 
 /// Decode a pointer handed to a worker entry point as `&[u8]`.
 fn decode_task_ptr(bytes: &[u8]) -> usize {
-    let buf: [u8; PTR_LEN] = bytes
-        .try_into()
-        .expect("worxide: task pointer payload had the wrong length");
+    let buf: [u8; PTR_LEN] = bytes.try_into().expect("worxide: task pointer payload had the wrong length");
     usize::from_le_bytes(buf)
 }
 
@@ -264,22 +241,16 @@ fn js_err(context: &'static str, v: JsValue) -> anyhow::Error {
         return anyhow!("{context}: {s}");
     }
     // 2. DOMException / Error — read .name + .message via Reflect.
-    let name = js_sys::Reflect::get(&v, &"name".into())
-        .ok()
-        .and_then(|x| x.as_string());
-    let msg = js_sys::Reflect::get(&v, &"message".into())
-        .ok()
-        .and_then(|x| x.as_string());
+    let name = js_sys::Reflect::get(&v, &"name".into()).ok().and_then(|x| x.as_string());
+    let msg = js_sys::Reflect::get(&v, &"message".into()).ok().and_then(|x| x.as_string());
     if name.is_some() || msg.is_some() {
         let n = name.as_deref().unwrap_or("Error");
         let m = msg.as_deref().unwrap_or("(no message)");
         return anyhow!("{context}: {n}: {m}");
     }
     // 3. Fall back to JSON.stringify.
-    let stringified = js_sys::JSON::stringify(&v)
-        .ok()
-        .and_then(|s| s.as_string())
-        .unwrap_or_else(|| "<unprintable JsValue>".to_owned());
+    let stringified =
+        js_sys::JSON::stringify(&v).ok().and_then(|s| s.as_string()).unwrap_or_else(|| "<unprintable JsValue>".to_owned());
     anyhow!("{context}: {stringified}")
 }
 
@@ -319,8 +290,7 @@ async fn construct_worker(
 ) -> Result<(WebWorker, Promise)> {
     let opts = WorkerOptions::new();
     opts.set_type(WorkerType::Module);
-    let worker = WebWorker::new_with_options(&worker_url, &opts)
-        .map_err(|e| js_err("Worker construction failed", e))?;
+    let worker = WebWorker::new_with_options(&worker_url, &opts).map_err(|e| js_err("Worker construction failed", e))?;
 
     let (promise, resolve, reject) = {
         let mut resolve_slot = None;
@@ -358,13 +328,10 @@ async fn construct_worker(
     let msg = js_sys::Object::new();
     Reflect::set(&msg, &"kind".into(), &JsValue::from_str(&kind.to_string()))
         .map_err(|e| js_err("set kind on message", e))?;
-    Reflect::set(&msg, &"module".into(), &module)
-        .map_err(|e| js_err("set module on message", e))?;
-    Reflect::set(&msg, &"memory".into(), &memory)
-        .map_err(|e| js_err("set memory on message", e))?;
+    Reflect::set(&msg, &"module".into(), &module).map_err(|e| js_err("set module on message", e))?;
+    Reflect::set(&msg, &"memory".into(), &memory).map_err(|e| js_err("set memory on message", e))?;
     // Pointer travels as little-endian bytes (a Uint8Array), never as an f64.
-    Reflect::set(&msg, &"ptr".into(), &ptr_to_js(task_ptr))
-        .map_err(|e| js_err("set ptr on message", e))?;
+    Reflect::set(&msg, &"ptr".into(), &ptr_to_js(task_ptr)).map_err(|e| js_err("set ptr on message", e))?;
     // The *resolved* glue URL goes over the wire so the worker (and any nested
     // spawn it makes) never has to re-derive it from a crate name or a global
     // it can't see. worker.js feeds this to `__worxide_seed_glue_url`.
@@ -373,9 +340,7 @@ async fn construct_worker(
 
     // Once postMessage succeeds, ownership of the boxed task has passed to
     // the worker thread; the worker is responsible for freeing it.
-    worker
-        .post_message(&msg)
-        .map_err(|e| js_err("postMessage to worker failed", e))?;
+    worker.post_message(&msg).map_err(|e| js_err("postMessage to worker failed", e))?;
     Ok((worker, promise))
 }
 
@@ -387,30 +352,27 @@ async fn run_inner(task_ptr: usize, kind: WorkerExecution, crate_name: &str) -> 
     let module = wasm_bindgen::module();
     let memory = wasm_bindgen::memory();
 
-    let (worker, promise) =
-        match construct_worker(task_ptr, kind, glue_url, module, memory, worker_url).await {
-            Ok(tuple) => tuple,
-            Err(e) => {
-                // We failed before/at postMessage, so the worker never took
-                // ownership of the task: reclaim and drop it here, freeing it as
-                // the *same* type we boxed (sync vs async). `kind` is `Copy`, so it
-                // is still available even though the block above captured a copy.
-                // SAFETY: task_ptr came from `WorkerTask::into_ptr` (Sync) or
-                // `AsyncWorkerTask::into_ptr` (Async) on this thread, per `kind`,
-                // and has not been freed.
-                unsafe {
-                    match kind {
-                        WorkerExecution::Sync => drop(WorkerTask::from_ptr(task_ptr)),
-                        WorkerExecution::Async => drop(AsyncWorkerTask::from_ptr(task_ptr)),
-                    }
+    let (worker, promise) = match construct_worker(task_ptr, kind, glue_url, module, memory, worker_url).await {
+        Ok(tuple) => tuple,
+        Err(e) => {
+            // We failed before/at postMessage, so the worker never took
+            // ownership of the task: reclaim and drop it here, freeing it as
+            // the *same* type we boxed (sync vs async). `kind` is `Copy`, so it
+            // is still available even though the block above captured a copy.
+            // SAFETY: task_ptr came from `WorkerTask::into_ptr` (Sync) or
+            // `AsyncWorkerTask::into_ptr` (Async) on this thread, per `kind`,
+            // and has not been freed.
+            unsafe {
+                match kind {
+                    WorkerExecution::Sync => drop(WorkerTask::from_ptr(task_ptr)),
+                    WorkerExecution::Async => drop(AsyncWorkerTask::from_ptr(task_ptr)),
                 }
-                return Err(e);
             }
-        };
+            return Err(e);
+        }
+    };
 
-    let resolved = JsFuture::from(promise)
-        .await
-        .map_err(|e| js_err("worker future rejected", e))?;
+    let resolved = JsFuture::from(promise).await.map_err(|e| js_err("worker future rejected", e))?;
     worker.terminate();
 
     // `resolved` is a structured-clone copy of the worker's Uint8Array, owned
@@ -505,9 +467,7 @@ fn new_promise() -> Result<(Promise, js_sys::Function, js_sys::Function)> {
 
 /// Read the `type` discriminator off a worker frame, if present.
 fn frame_type(data: &JsValue) -> Option<String> {
-    Reflect::get(data, &JsValue::from_str("type"))
-        .ok()
-        .and_then(|v| v.as_string())
+    Reflect::get(data, &JsValue::from_str("type")).ok().and_then(|v| v.as_string())
 }
 
 /// A persistent Web Worker attached to this thread's shared memory.
@@ -539,15 +499,11 @@ impl Worker {
     /// relies on this, since the glue lives in the *app's* wasm, not the
     /// library's. Errors if `app_js_path` is unset and nothing has seeded the
     /// glue URL yet — use [`Worker::with_glue`] to pass it explicitly.
-    pub async fn new() -> Result<Self> {
-        Self::boot(glue_url_via_app_path()?).await
-    }
+    pub async fn new() -> Result<Self> { Self::boot(glue_url_via_app_path()?).await }
 
     /// Like [`Worker::new`], but with an explicit glue path/URL (resolved
     /// against the document base) instead of `globalThis.app_js_path`.
-    pub async fn with_glue(glue_path: &str) -> Result<Self> {
-        Self::boot(glue_url_explicit(glue_path)).await
-    }
+    pub async fn with_glue(glue_path: &str) -> Result<Self> { Self::boot(glue_url_explicit(glue_path)).await }
 
     async fn boot(glue_url: String) -> Result<Self> {
         let worker_url = worker_url()?;
@@ -556,8 +512,7 @@ impl Worker {
 
         let opts = WorkerOptions::new();
         opts.set_type(WorkerType::Module);
-        let inner = WebWorker::new_with_options(&worker_url, &opts)
-            .map_err(|e| js_err("Worker construction failed", e))?;
+        let inner = WebWorker::new_with_options(&worker_url, &opts).map_err(|e| js_err("Worker construction failed", e))?;
 
         let pending: Rc<RefCell<HashMap<u64, Pending>>> = Rc::new(RefCell::new(HashMap::new()));
         let next_id = Rc::new(Cell::new(0u64));
@@ -578,10 +533,7 @@ impl Worker {
                         let _ = ready_resolve.call0(&JsValue::NULL);
                     }
                     Some("result") => {
-                        let Some(id) = Reflect::get(&data, &"id".into())
-                            .ok()
-                            .and_then(|v| v.as_f64())
-                            .map(|f| f as u64)
+                        let Some(id) = Reflect::get(&data, &"id".into()).ok().and_then(|v| v.as_f64()).map(|f| f as u64)
                         else {
                             return;
                         };
@@ -596,8 +548,7 @@ impl Worker {
                                 let _ = p.reject.call1(&JsValue::NULL, &e);
                             }
                             _ => {
-                                let result = Reflect::get(&data, &"result".into())
-                                    .unwrap_or(JsValue::UNDEFINED);
+                                let result = Reflect::get(&data, &"result".into()).unwrap_or(JsValue::UNDEFINED);
                                 let _ = p.resolve.call1(&JsValue::NULL, &result);
                             }
                         }
@@ -634,30 +585,16 @@ impl Worker {
         // URL. worker.js imports the glue, runs initSync ONCE, seeds the glue
         // URL, and replies `{ type: "ready" }`.
         let msg = js_sys::Object::new();
-        Reflect::set(&msg, &"type".into(), &"init".into())
-            .map_err(|e| js_err("set type on init", e))?;
-        Reflect::set(&msg, &"module".into(), &module)
-            .map_err(|e| js_err("set module on init", e))?;
-        Reflect::set(&msg, &"memory".into(), &memory)
-            .map_err(|e| js_err("set memory on init", e))?;
+        Reflect::set(&msg, &"type".into(), &"init".into()).map_err(|e| js_err("set type on init", e))?;
+        Reflect::set(&msg, &"module".into(), &module).map_err(|e| js_err("set module on init", e))?;
+        Reflect::set(&msg, &"memory".into(), &memory).map_err(|e| js_err("set memory on init", e))?;
         Reflect::set(&msg, &"glue_url".into(), &JsValue::from_str(&glue_url))
             .map_err(|e| js_err("set glue_url on init", e))?;
-        inner
-            .post_message(&msg)
-            .map_err(|e| js_err("postMessage(init) failed", e))?;
+        inner.post_message(&msg).map_err(|e| js_err("postMessage(init) failed", e))?;
 
-        JsFuture::from(ready)
-            .await
-            .map_err(|e| js_err("worker init failed", e))?;
+        JsFuture::from(ready).await.map_err(|e| js_err("worker init failed", e))?;
 
-        Ok(Self {
-            inner,
-            pending,
-            next_id,
-            dead,
-            _on_message: on_message,
-            _on_error: on_error,
-        })
+        Ok(Self { inner, pending, next_id, dead, _on_message: on_message, _on_error: on_error })
     }
 
     /// Run a synchronous closure on the worker and await its result. `R` is
@@ -669,9 +606,7 @@ impl Worker {
         R: Send + 'static,
     {
         let task = WorkerTask::new(move || box_result(f()));
-        let bytes = self
-            .dispatch(task.into_ptr(), WorkerExecution::Sync)
-            .await?;
+        let bytes = self.dispatch(task.into_ptr(), WorkerExecution::Sync).await?;
         let result_ptr = ptr_from_js(&bytes)?;
         // SAFETY: result_ptr came from box_result::<R> on the worker; R: Send.
         Ok(unsafe { unbox_result::<R>(result_ptr as *mut ()) })
@@ -686,9 +621,7 @@ impl Worker {
         R: Send + 'static,
     {
         let task = AsyncWorkerTask::new(move || async move { box_result(f().await) });
-        let bytes = self
-            .dispatch(task.into_ptr(), WorkerExecution::Async)
-            .await?;
+        let bytes = self.dispatch(task.into_ptr(), WorkerExecution::Async).await?;
         let result_ptr = ptr_from_js(&bytes)?;
         // SAFETY: result_ptr came from box_result::<R> on the worker; R: Send.
         Ok(unsafe { unbox_result::<R>(result_ptr as *mut ()) })
@@ -708,9 +641,7 @@ impl Worker {
                     WorkerExecution::Async => drop(AsyncWorkerTask::from_ptr(task_ptr)),
                 }
             }
-            return Err(anyhow!(
-                "worxide::Worker is dead (an earlier worker error tore it down); construct a new one"
-            ));
+            return Err(anyhow!("worxide::Worker is dead (an earlier worker error tore it down); construct a new one"));
         }
 
         let id = {
@@ -719,19 +650,14 @@ impl Worker {
             n
         };
         let (promise, resolve, reject) = new_promise()?;
-        self.pending
-            .borrow_mut()
-            .insert(id, Pending { resolve, reject });
+        self.pending.borrow_mut().insert(id, Pending { resolve, reject });
 
         let msg = js_sys::Object::new();
-        Reflect::set(&msg, &"type".into(), &"call".into())
-            .map_err(|e| js_err("set type on call", e))?;
-        Reflect::set(&msg, &"id".into(), &JsValue::from_f64(id as f64))
-            .map_err(|e| js_err("set id on call", e))?;
+        Reflect::set(&msg, &"type".into(), &"call".into()).map_err(|e| js_err("set type on call", e))?;
+        Reflect::set(&msg, &"id".into(), &JsValue::from_f64(id as f64)).map_err(|e| js_err("set id on call", e))?;
         Reflect::set(&msg, &"kind".into(), &JsValue::from_str(&kind.to_string()))
             .map_err(|e| js_err("set kind on call", e))?;
-        Reflect::set(&msg, &"ptr".into(), &ptr_to_js(task_ptr))
-            .map_err(|e| js_err("set ptr on call", e))?;
+        Reflect::set(&msg, &"ptr".into(), &ptr_to_js(task_ptr)).map_err(|e| js_err("set ptr on call", e))?;
 
         if let Err(e) = self.inner.post_message(&msg) {
             // Never reached the worker: drop the pending entry and reclaim the
@@ -747,9 +673,7 @@ impl Worker {
             return Err(js_err("postMessage(call) failed", e));
         }
 
-        JsFuture::from(promise)
-            .await
-            .map_err(|e| js_err("worker task failed", e))
+        JsFuture::from(promise).await.map_err(|e| js_err("worker task failed", e))
     }
 
     /// The underlying worker.
@@ -758,20 +682,14 @@ impl Worker {
     /// worker an `OffscreenCanvas`) and attach its own `addEventListener`
     /// side-channels alongside worxide's listener — that traffic does not pass
     /// through worxide's own dispatch.
-    pub fn raw(&self) -> &WebWorker {
-        &self.inner
-    }
+    pub fn raw(&self) -> &WebWorker { &self.inner }
 
     /// Terminate the worker immediately. Idempotent; also runs on drop.
-    pub fn terminate(&self) {
-        self.inner.terminate();
-    }
+    pub fn terminate(&self) { self.inner.terminate(); }
 }
 
 impl Drop for Worker {
-    fn drop(&mut self) {
-        self.inner.terminate();
-    }
+    fn drop(&mut self) { self.inner.terminate(); }
 }
 
 // Drives a future to completion on the worker's own event loop, returning
@@ -799,9 +717,7 @@ impl DriveState {
         if let Poll::Ready(result_ptr) = slot.as_mut().poll(&mut cx) {
             drop(slot);
             // Resolve with the result pointer encoded as little-endian bytes.
-            self.resolve
-                .call1(&JsValue::NULL, &ptr_to_js(result_ptr as usize))
-                .unwrap();
+            self.resolve.call1(&JsValue::NULL, &ptr_to_js(result_ptr as usize)).unwrap();
             // Break the self-cycle so everything can be freed.
             *self.this.borrow_mut() = None;
         }
@@ -847,9 +763,7 @@ impl DriveState {
             rc.schedule();
             std::mem::forget(rc);
         }
-        unsafe fn drop_fn(data: *const ()) {
-            drop(unsafe { Rc::from_raw(data as *const DriveState) });
-        }
+        unsafe fn drop_fn(data: *const ()) { drop(unsafe { Rc::from_raw(data as *const DriveState) }); }
         static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, wake, wake_by_ref, drop_fn);
         let raw = Rc::into_raw(self) as *const ();
         // SAFETY: see the doc comment above. The waker never leaves its origin
@@ -864,9 +778,7 @@ pub fn drive_to_promise(fut: Pin<Box<dyn Future<Output = *mut ()>>>) -> js_sys::
     // can move it out exactly once into the shared state.
     let mut fut_holder = Some(fut);
     js_sys::Promise::new(&mut |resolve, _reject| {
-        let fut = fut_holder
-            .take()
-            .expect("Promise executor ran more than once");
+        let fut = fut_holder.take().expect("Promise executor ran more than once");
         let state = Rc::new(DriveState {
             fut: Rc::new(RefCell::new(fut)),
             resolve,
@@ -902,9 +814,7 @@ extern "C" {
 /// worker performs reuse the already-resolved URL instead of re-deriving it —
 /// crucial because `window` / `globalThis.app_js_path` is not set on workers.
 #[wasm_bindgen]
-pub fn __worxide_seed_glue_url(url: String) {
-    GLUE_URL.with(|cell| *cell.borrow_mut() = Some(url));
-}
+pub fn __worxide_seed_glue_url(url: String) { GLUE_URL.with(|cell| *cell.borrow_mut() = Some(url)); }
 
 /// Worker thread entry point for sync tasks. Returns the result pointer bytes.
 #[wasm_bindgen]
