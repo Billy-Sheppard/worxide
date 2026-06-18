@@ -92,10 +92,9 @@ fn sync_task(func: &str, f: fn(u64) -> u64, param: u64) -> PoolTask {
         run: Box::new(move |mode| {
             Box::pin(async move {
                 match mode {
-                    Mode::Worker => worxide::spawn_blocking!(f, param)
-                        .await
-                        .map(|r| format!("Res: {r}"))
-                        .map_err(|e| e.to_string()),
+                    Mode::Worker => {
+                        worxide::spawn_blocking!(f, param).await.map(|r| format!("Res: {r}")).map_err(|e| e.to_string())
+                    }
                     // Runs inline on the main thread — blocks the UI until done.
                     Mode::MainThread => Ok(format!("Res: {}", f(param))),
                 }
@@ -174,11 +173,7 @@ fn spawn_job(
         g.remove(idx)
     };
 
-    let worker = Arc::new(Worker {
-        name: key.into(),
-        title: Arc::from(task.title.as_str()),
-        result: Mutable::new(None),
-    });
+    let worker = Arc::new(Worker { name: key.into(), title: Arc::from(task.title.as_str()), result: Mutable::new(None) });
     workers.lock_mut().push_cloned(worker.clone());
 
     wasm_bindgen_futures::spawn_local(async move {
@@ -288,10 +283,7 @@ pub async fn run_app() -> Result<(), JsValue> {
                             .to_signal_cloned()
                             .map(|vec: Vec<Option<Result<String, String>>>| {
                                 vec.iter().any(Option::is_none).then_some(
-                                    html_button()
-                                        .class(["button", "is-loading"])
-                                        .style("height", "100%")
-                                        .into_dom(),
+                                    html_button().class(["button", "is-loading"]).style("height", "100%").into_dom(),
                                 )
                             })
                     })
@@ -307,9 +299,11 @@ pub async fn run_app() -> Result<(), JsValue> {
                             html_button()
                                 .class("button")
                                 .style("height", "100%")
-                                .text_signal(pressure.signal_cloned().map(|p| {
-                                    format!("CPU Pressure: {}", p.unwrap_or_else(|| "—".into()))
-                                }))
+                                .text_signal(
+                                    pressure
+                                        .signal_cloned()
+                                        .map(|p| format!("CPU Pressure: {}", p.unwrap_or_else(|| "—".into()))),
+                                )
                                 .into_dom(),
                         )
                     })
@@ -341,10 +335,7 @@ pub async fn run_app() -> Result<(), JsValue> {
                         .child(
                             html_button()
                                 .class("button")
-                                .class_signal(
-                                    "is-warning",
-                                    mode.signal().map(|m| m == Mode::MainThread),
-                                )
+                                .class_signal("is-warning", mode.signal().map(|m| m == Mode::MainThread))
                                 .text("Main Thread")
                                 .event({
                                     let mode = mode.clone();
@@ -396,9 +387,7 @@ pub async fn run_app() -> Result<(), JsValue> {
                                             let names = names.clone();
                                             let mode = mode.clone();
                                             move |_: events::Click| {
-                                                while spawn_job(&names, &pool, &workers, mode.get())
-                                                {
-                                                }
+                                                while spawn_job(&names, &pool, &workers, mode.get()) {}
                                             }
                                         })
                                         .into_dom(),
@@ -460,12 +449,7 @@ pub async fn run_app() -> Result<(), JsValue> {
                                         .style("width", "100%")
                                         .style("border", "white dashed 1px")
                                         .style("border-radius", "1rem")
-                                        .child(
-                                            html_h2()
-                                                .class("subtitle")
-                                                .text(worker.name.as_ref())
-                                                .into_dom(),
-                                        )
+                                        .child(html_h2().class("subtitle").text(worker.name.as_ref()).into_dom())
                                         .child(html_h3().text(worker.title.as_ref()).into_dom())
                                         .child_signal(worker.result.signal_cloned().map(|res| {
                                             Some(
@@ -473,9 +457,7 @@ pub async fn run_app() -> Result<(), JsValue> {
                                                     .class("button")
                                                     .style("width", "100%")
                                                     .style("height", "40px")
-                                                    .apply_if(res.is_none(), |b| {
-                                                        b.class("is-loading")
-                                                    })
+                                                    .apply_if(res.is_none(), |b| b.class("is-loading"))
                                                     .apply_if(res.is_some(), |b| {
                                                         b.text(match res.as_ref().unwrap() {
                                                             Ok(s) => s.as_str(),
@@ -521,22 +503,19 @@ fn start_fps_meter(fps: Mutable<f64>) {
         if let Some(w) = web_sys::window()
             && let Some(c) = cb.lock_ref().as_ref()
         {
-            w.request_animation_frame(c.as_ref().unchecked_ref())
-                .unwrap();
+            w.request_animation_frame(c.as_ref().unchecked_ref()).unwrap();
         }
     }) as Box<dyn FnMut()>)));
 
     if let Some(w) = web_sys::window()
         && let Some(c) = callback.lock_ref().as_ref()
     {
-        w.request_animation_frame(c.as_ref().unchecked_ref())
-            .unwrap();
+        w.request_animation_frame(c.as_ref().unchecked_ref()).unwrap();
     }
 }
 
 fn start_pressure_observer(pressure: Mutable<Option<String>>) {
-    let constructor = if let Ok(v) =
-        js_sys::Reflect::get(&js_sys::global(), &JsValue::from_str("PressureObserver"))
+    let constructor = if let Ok(v) = js_sys::Reflect::get(&js_sys::global(), &JsValue::from_str("PressureObserver"))
         && v.is_null_or_undefined().not()
     {
         v.unchecked_into::<js_sys::Function>()
@@ -548,8 +527,7 @@ fn start_pressure_observer(pressure: Mutable<Option<String>>) {
         if let Ok(arr) = records.dyn_into::<js_sys::Array>() {
             let len = arr.length();
             if len.gt(&0)
-                && let Ok(s) =
-                    js_sys::Reflect::get(&arr.get(len.sub(1)), &JsValue::from_str("state"))
+                && let Ok(s) = js_sys::Reflect::get(&arr.get(len.sub(1)), &JsValue::from_str("state"))
                 && let Some(s) = s.as_string()
             {
                 pressure.set(Some(s));
@@ -557,10 +535,8 @@ fn start_pressure_observer(pressure: Mutable<Option<String>>) {
         }
     }) as Box<dyn FnMut(JsValue)>);
 
-    let observer = if let Ok(o) = js_sys::Reflect::construct(
-        &constructor,
-        &js_sys::Array::of1(cb.as_ref().unchecked_ref()),
-    ) {
+    let observer = if let Ok(o) = js_sys::Reflect::construct(&constructor, &js_sys::Array::of1(cb.as_ref().unchecked_ref()))
+    {
         o
     } else {
         cb.forget();
@@ -572,21 +548,9 @@ fn start_pressure_observer(pressure: Mutable<Option<String>>) {
         && let Ok(observe_fn) = observe.dyn_into::<js_sys::Function>()
     {
         let opts = js_sys::Object::new();
-        js_sys::Reflect::set(
-            &opts,
-            &JsValue::from_str("sampleInterval"),
-            &JsValue::from_f64(500.0),
-        )
-        .unwrap();
-        observe_fn
-            .call2(&observer, &JsValue::from_str("cpu"), &opts)
-            .unwrap();
+        js_sys::Reflect::set(&opts, &JsValue::from_str("sampleInterval"), &JsValue::from_f64(500.0)).unwrap();
+        observe_fn.call2(&observer, &JsValue::from_str("cpu"), &opts).unwrap();
     }
 }
 
-fn now_ms() -> f64 {
-    web_sys::window()
-        .and_then(|w| w.performance())
-        .map(|p| p.now())
-        .unwrap_or(0.0)
-}
+fn now_ms() -> f64 { web_sys::window().and_then(|w| w.performance()).map(|p| p.now()).unwrap_or(0.0) }
