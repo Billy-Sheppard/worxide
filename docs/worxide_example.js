@@ -1,5 +1,5 @@
-import { worxide_app_js_path, worxide_glue_url, worxide_glue_url_from_path } from './snippets/worxide-593c3a9d3926efa8/inline0.js';
-import * as import1 from "./snippets/worxide-593c3a9d3926efa8/inline1.js"
+import { worxide_app_js_path, worxide_glue_url, worxide_glue_url_from_path } from './snippets/worxide-4b3aa5f456133323/inline0.js';
+import * as import1 from "./snippets/worxide-4b3aa5f456133323/inline1.js"
 
 
 /**
@@ -19,7 +19,7 @@ export function __worxide_seed_glue_url(url) {
 
 /**
  * Worker thread entry point for sync tasks. Returns the result pointer bytes,
- * or `Err` (thrown to JS and caught by worker.js as a per-call error frame) if
+ * or `Err` (thrown to JS and caught by worker.js as a per-call error envelope) if
  * the payload is malformed — see [`decode_task_ptr`].
  * @param {Uint8Array} ptr_bytes
  * @returns {Uint8Array}
@@ -56,7 +56,10 @@ export function __worxide_worker_entry_async(ptr_bytes) {
     const ptr0 = passArray8ToWasm0(ptr_bytes, wasm.__wbindgen_malloc);
     const len0 = WASM_VECTOR_LEN;
     const ret = wasm.__worxide_worker_entry_async(ptr0, len0);
-    return ret;
+    if (ret[2]) {
+        throw takeFromExternrefTable0(ret[1]);
+    }
+    return takeFromExternrefTable0(ret[0]);
 }
 
 /**
@@ -450,10 +453,6 @@ function __wbg_get_imports(memory) {
             const ret = Math.random();
             return ret;
         },
-        __wbg_reject_142c43e36402c65b: function(arg0) {
-            const ret = Promise.reject(arg0);
-            return ret;
-        },
         __wbg_removeChild_8e93fdf43472d328: function() { return handleError(function (arg0, arg1) {
             const ret = arg0.removeChild(arg1);
             return ret;
@@ -621,14 +620,14 @@ function __wbg_get_imports(memory) {
             const ret = Atomics.waitAsync;
             return ret;
         },
-        __wbg_worxide_app_js_path_a64a67e2ecc92d5b: function(arg0) {
+        __wbg_worxide_app_js_path_813d8320a2fe4052: function(arg0) {
             const ret = worxide_app_js_path();
             var ptr1 = isLikeNone(ret) ? 0 : passStringToWasm0(ret, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
             var len1 = WASM_VECTOR_LEN;
             getDataViewMemory0().setInt32(arg0 + 4 * 1, len1, true);
             getDataViewMemory0().setInt32(arg0 + 4 * 0, ptr1, true);
         },
-        __wbg_worxide_glue_url_533c15b120cfe7df: function(arg0, arg1, arg2) {
+        __wbg_worxide_glue_url_7e7e5b302a0a168d: function(arg0, arg1, arg2) {
             var v0 = getCachedStringFromWasm0(arg1, arg2);
             const ret = worxide_glue_url(v0);
             const ptr2 = passStringToWasm0(ret, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
@@ -636,7 +635,7 @@ function __wbg_get_imports(memory) {
             getDataViewMemory0().setInt32(arg0 + 4 * 1, len2, true);
             getDataViewMemory0().setInt32(arg0 + 4 * 0, ptr2, true);
         },
-        __wbg_worxide_glue_url_from_path_5aae197a34a2df14: function(arg0, arg1, arg2) {
+        __wbg_worxide_glue_url_from_path_65304c5c79353584: function(arg0, arg1, arg2) {
             var v0 = getCachedStringFromWasm0(arg1, arg2);
             const ret = worxide_glue_url_from_path(v0);
             const ptr2 = passStringToWasm0(ret, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
@@ -661,7 +660,7 @@ function __wbg_get_imports(memory) {
         },
         __wbindgen_cast_0000000000000004: function(arg0, arg1) {
             // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [Ref(NamedExternref("Event"))], shim_idx: 24, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
-            const ret = makeMutClosure(arg0, arg1, wasm_bindgen_5968a9e4e00efcb7___convert__closures________invoke___web_sys_977ed13a694527c3___features__gen_Event__Event______true_);
+            const ret = makeMutClosure(arg0, arg1, wasm_bindgen_5968a9e4e00efcb7___convert__closures________invoke___web_sys_668e364f617a464b___features__gen_Event__Event______true_);
             return ret;
         },
         __wbindgen_cast_0000000000000005: function(arg0, arg1) {
@@ -708,7 +707,7 @@ function __wbg_get_imports(memory) {
     return {
         __proto__: null,
         "./worxide_example_bg.js": import0,
-        "./snippets/worxide-593c3a9d3926efa8/inline1.js": import1,
+        "./snippets/worxide-4b3aa5f456133323/inline1.js": import1,
     };
 }
 
@@ -724,8 +723,8 @@ function wasm_bindgen_5968a9e4e00efcb7___convert__closures_____invoke___wasm_bin
     wasm.wasm_bindgen_5968a9e4e00efcb7___convert__closures_____invoke___wasm_bindgen_5968a9e4e00efcb7___JsValue______true__2(arg0, arg1, arg2);
 }
 
-function wasm_bindgen_5968a9e4e00efcb7___convert__closures________invoke___web_sys_977ed13a694527c3___features__gen_Event__Event______true_(arg0, arg1, arg2) {
-    wasm.wasm_bindgen_5968a9e4e00efcb7___convert__closures________invoke___web_sys_977ed13a694527c3___features__gen_Event__Event______true_(arg0, arg1, arg2);
+function wasm_bindgen_5968a9e4e00efcb7___convert__closures________invoke___web_sys_668e364f617a464b___features__gen_Event__Event______true_(arg0, arg1, arg2) {
+    wasm.wasm_bindgen_5968a9e4e00efcb7___convert__closures________invoke___web_sys_668e364f617a464b___features__gen_Event__Event______true_(arg0, arg1, arg2);
 }
 
 function wasm_bindgen_5968a9e4e00efcb7___convert__closures_____invoke___wasm_bindgen_5968a9e4e00efcb7___JsValue__core_ad197ea32fa24677___result__Result_____wasm_bindgen_5968a9e4e00efcb7___JsError___true_(arg0, arg1, arg2) {
