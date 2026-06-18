@@ -426,7 +426,7 @@ where
 //   worker -> main  { type: "result", id, result }            // success
 //   worker -> main  { type: "result", id, error }             // task threw
 //
-// The legacy one-shot message used by `run_inner` carries no `type`, so
+// The one-shot message used by `run_inner` carries no `type`, so
 // worker.js keeps routing it through the old path untouched — `spawn!` users
 // see no change.
 //

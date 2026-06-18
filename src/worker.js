@@ -17,8 +17,7 @@
 //       worker -> main  { type: "result", id, error }    // task threw
 //     init runs initSync ONCE; later `call` frames reuse the same instance.
 //
-//   * One-shot macros (spawn! / spawn_blocking!) — the legacy untyped message
-//       { kind, module, memory, ptr, glue_url }  ->  postMessage(result_ptr)
+//   * One-shot macros (spawn! / spawn_blocking!) — the untyped message { kind, module, memory, ptr, glue_url }  ->  postMessage(result_ptr)
 //     It carries no `type`, so it falls through to the original path below and
 //     is unchanged.
 //
@@ -70,8 +69,8 @@ self.addEventListener('message', async (ev) => {
         return;
     }
 
-    // --- legacy one-shot path (spawn! / spawn_blocking!) ----------------
-    // Only genuine legacy frames: no typed discriminator, but carrying the
+    // --- one-shot path (spawn! / spawn_blocking!) ----------------
+    // Only genuine frames: no typed discriminator, but carrying the
     // one-shot payload (a glue_url to import). Anything else on this channel
     // belongs to a consumer sharing the worker via raw() (e.g. canvas/mouse
     // side-channels) — not ours, so ignore it rather than mis-handling it.
