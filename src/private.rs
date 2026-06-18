@@ -530,7 +530,7 @@ impl Worker {
                 let data = ev.data();
                 match frame_type(&data).as_deref() {
                     Some("ready") => {
-                        let _ = ready_resolve.call0(&JsValue::NULL);
+                        ready_resolve.call0(&JsValue::NULL).unwrap();
                     }
                     Some("result") => {
                         let Some(id) = Reflect::get(&data, &"id".into()).ok().and_then(|v| v.as_f64()).map(|f| f as u64)
@@ -545,11 +545,11 @@ impl Worker {
                         let err = Reflect::get(&data, &"error".into()).ok();
                         match err {
                             Some(e) if !e.is_undefined() && !e.is_null() => {
-                                let _ = p.reject.call1(&JsValue::NULL, &e);
+                                p.reject.call1(&JsValue::NULL, &e).unwrap();
                             }
                             _ => {
                                 let result = Reflect::get(&data, &"result".into()).unwrap_or(JsValue::UNDEFINED);
-                                let _ = p.resolve.call1(&JsValue::NULL, &result);
+                                p.resolve.call1(&JsValue::NULL, &result).unwrap();
                             }
                         }
                     }
@@ -570,10 +570,10 @@ impl Worker {
             let ready_reject = reject_ready.clone();
             Closure::<dyn FnMut(JsValue)>::new(move |e: JsValue| {
                 dead.set(true);
-                let _ = ready_reject.call1(&JsValue::NULL, &e);
+                ready_reject.call1(&JsValue::NULL, &e).unwrap();
                 let drained: Vec<Pending> = pending.borrow_mut().drain().map(|(_, p)| p).collect();
                 for p in drained {
-                    let _ = p.reject.call1(&JsValue::NULL, &e);
+                    p.reject.call1(&JsValue::NULL, &e).unwrap();
                 }
             })
         };
