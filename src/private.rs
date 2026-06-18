@@ -202,6 +202,14 @@ pub fn box_result<T: Send + 'static>(value: T) -> *mut () { Box::into_raw(Box::n
 /// # Safety: ptr must come from `box_result::<T>` and not be freed yet.
 pub unsafe fn unbox_result<T: Send + 'static>(ptr: *mut ()) -> T { unsafe { *Box::from_raw(ptr as *mut T) } }
 
+/// Free a result box produced by [`box_result`] as its concrete `R`, *without*
+/// returning the value. Used on the cancellation/abandon path: the awaiting
+/// `run`/`run_blocking` future that would normally [`unbox_result`] (and drop)
+/// is gone, but the worker still produced a box that has to be freed somewhere.
+///
+/// # Safety: `ptr` must come from `box_result::<R>` and not have been taken yet.
+unsafe fn free_result_box<R: 'static>(ptr: usize) { drop(unsafe { Box::from_raw(ptr as *mut R) }); }
+
 // A pointer crosses the `postMessage` boundary — and resolves the async
 // worker's Promise — as a little-endian byte payload, never as an `f64`. The
 // worker entry points take `&[u8]` and return `Vec<u8>`, so the bytes are
@@ -228,10 +236,30 @@ fn ptr_from_js(v: &JsValue) -> Result<usize> {
     Ok(usize::from_le_bytes(buf))
 }
 
+/// Encode a 64-bit call id as little-endian bytes (a fresh `Uint8Array`).
+///
+/// Sent verbatim by worker.js in the matching `result` frame. Bytes rather than
+/// an `f64` so the id round-trips losslessly past 2^53 — a collision between two
+/// in-flight ids would route a result to the wrong call and unbox it as the
+/// wrong type, so the transport has to be exact.
+fn id_to_js(id: u64) -> JsValue { js_sys::Uint8Array::from(&id.to_le_bytes()[..]).into() }
+
+/// Decode a call id produced by [`id_to_js`].
+fn id_from_js(v: &JsValue) -> Option<u64> {
+    let arr = v.dyn_ref::<js_sys::Uint8Array>()?;
+    let buf: [u8; 8] = arr.to_vec().as_slice().try_into().ok()?;
+    Some(u64::from_le_bytes(buf))
+}
+
 /// Decode a pointer handed to a worker entry point as `&[u8]`.
-fn decode_task_ptr(bytes: &[u8]) -> usize {
-    let buf: [u8; PTR_LEN] = bytes.try_into().expect("worxide: task pointer payload had the wrong length");
-    usize::from_le_bytes(buf)
+///
+/// Returns `Err` (rather than trapping) on a wrong-length payload: the worker's
+/// message channel is shared with consumers via [`Worker::raw`], so a stray
+/// frame must degrade to a rejected call, not abort the whole shared instance.
+fn decode_task_ptr(bytes: &[u8]) -> Result<usize, JsValue> {
+    let buf: [u8; PTR_LEN] =
+        bytes.try_into().map_err(|_| JsValue::from_str("worxide: task pointer payload had the wrong length"))?;
+    Ok(usize::from_le_bytes(buf))
 }
 
 fn js_err(context: &'static str, v: JsValue) -> anyhow::Error {
@@ -443,10 +471,65 @@ where
 // is not unboxed and leaks. Freeing it requires a type-erased deallocator per
 // call; not wired up yet.
 
-/// One in-flight call awaiting its `result` frame.
+/// Where a call's outcome lands. `on_message` deposits into the shared slot and
+/// fires the call's signal; the awaiting `dispatch` future takes it on resume.
+/// If that future was dropped first, [`AbandonGuard`] frees any deposited result
+/// box, so a cancelled call leaks nothing.
+enum Slot {
+    /// No reply yet.
+    Waiting,
+    /// Result pointer, decoded from the reply, not yet taken.
+    Ok(usize),
+    /// Task threw, worker died, or the reply was malformed.
+    Err(String),
+    /// The awaiting future is gone; `on_message` must free the box itself.
+    Abandoned,
+    /// Outcome consumed by the awaiter.
+    Done,
+}
+
+/// One in-flight call. Lives in `Worker::pending` keyed by id until its `result`
+/// frame arrives (or the worker dies).
 struct Pending {
-    resolve: js_sys::Function,
-    reject: js_sys::Function,
+    /// Shared with the awaiting `dispatch` future and its [`AbandonGuard`].
+    slot: Rc<RefCell<Slot>>,
+    /// Resolve fn of the call's signal promise; called (no payload) to wake the
+    /// awaiter once `slot` holds an outcome.
+    signal: js_sys::Function,
+    /// Frees a deposited result box as its concrete `R`; used only when the call
+    /// was abandoned (the live path unboxes in `run`/`run_blocking`).
+    free_result: unsafe fn(usize),
+}
+
+/// RAII guard held across `dispatch`'s await. If the awaiting future is dropped
+/// before it takes the outcome, this reaps the result box that would otherwise
+/// leak:
+///   * one that already landed (`Slot::Ok`) is freed here, and
+///   * one still in flight is handled by flipping the slot to `Abandoned`, so
+///     the late `result` frame is freed by `on_message` instead of delivered.
+///
+/// Disarmed once `dispatch` has taken the outcome.
+struct AbandonGuard {
+    slot: Rc<RefCell<Slot>>,
+    free_result: unsafe fn(usize),
+    armed: Cell<bool>,
+}
+
+impl AbandonGuard {
+    fn disarm(&self) { self.armed.set(false); }
+}
+
+impl Drop for AbandonGuard {
+    fn drop(&mut self) {
+        if !self.armed.get() {
+            return;
+        }
+        // Awaiter dropped before taking its outcome. Free a result that already
+        // landed; otherwise mark the slot so a late frame is reaped downstream.
+        if let Slot::Ok(ptr) = std::mem::replace(&mut *self.slot.borrow_mut(), Slot::Abandoned) {
+            unsafe { (self.free_result)(ptr) }
+        }
+    }
 }
 
 /// Create a fresh JS `Promise`, returning it alongside its `resolve`/`reject`
@@ -530,27 +613,47 @@ impl Worker {
                 let data = ev.data();
                 match frame_type(&data).as_deref() {
                     Some("ready") => {
-                        ready_resolve.call0(&JsValue::NULL).unwrap();
+                        ready_resolve.call0(&JsValue::NULL).ok();
                     }
                     Some("result") => {
-                        let Some(id) = Reflect::get(&data, &"id".into()).ok().and_then(|v| v.as_f64()).map(|f| f as u64)
-                        else {
+                        let Some(id) = Reflect::get(&data, &"id".into()).ok().and_then(|v| id_from_js(&v)) else {
                             return;
                         };
-                        // If the id is unknown the call was already settled or
-                        // cancelled; drop the frame. (See the cleanup-gap note.)
+                        // Unknown id: the call already settled, or it's a stray
+                        // frame on the shared channel. Drop it.
                         let Some(p) = pending.borrow_mut().remove(&id) else {
                             return;
                         };
+                        // Decode the frame into an outcome before touching the
+                        // slot, so the abandoned branch can free or the live
+                        // branch can deposit.
                         let err = Reflect::get(&data, &"error".into()).ok();
-                        match err {
+                        let outcome = match err {
                             Some(e) if !e.is_undefined() && !e.is_null() => {
-                                p.reject.call1(&JsValue::NULL, &e).unwrap();
+                                Slot::Err(e.as_string().unwrap_or_else(|| "worxide: worker task error".to_owned()))
                             }
                             _ => {
                                 let result = Reflect::get(&data, &"result".into()).unwrap_or(JsValue::UNDEFINED);
-                                p.resolve.call1(&JsValue::NULL, &result).unwrap();
+                                match ptr_from_js(&result) {
+                                    Ok(ptr) => Slot::Ok(ptr),
+                                    Err(e) => Slot::Err(format!("{e:#}")),
+                                }
                             }
+                        };
+                        let mut slot = p.slot.borrow_mut();
+                        if matches!(&*slot, Slot::Abandoned) {
+                            // Awaiter already gone: free the result box ourselves
+                            // rather than delivering it into the void.
+                            if let Slot::Ok(ptr) = outcome {
+                                // SAFETY: ptr came from box_result::<R> on the
+                                // worker; free_result is that R's deallocator.
+                                unsafe { (p.free_result)(ptr) };
+                            }
+                        } else {
+                            *slot = outcome;
+                            drop(slot);
+                            // Wake the awaiter; it takes the outcome from `slot`.
+                            p.signal.call0(&JsValue::NULL).ok();
                         }
                     }
                     _ => {}
@@ -570,10 +673,18 @@ impl Worker {
             let ready_reject = reject_ready.clone();
             Closure::<dyn FnMut(JsValue)>::new(move |e: JsValue| {
                 dead.set(true);
-                ready_reject.call1(&JsValue::NULL, &e).unwrap();
+                ready_reject.call1(&JsValue::NULL, &e).ok();
+                let why = e.as_string().unwrap_or_else(|| "worxide: worker error".to_owned());
                 let drained: Vec<Pending> = pending.borrow_mut().drain().map(|(_, p)| p).collect();
                 for p in drained {
-                    p.reject.call1(&JsValue::NULL, &e).unwrap();
+                    let mut slot = p.slot.borrow_mut();
+                    // A dead worker produced no result box, so there is nothing
+                    // to free on the abandoned path — just fail the live calls.
+                    if !matches!(&*slot, Slot::Abandoned) {
+                        *slot = Slot::Err(why.clone());
+                        drop(slot);
+                        p.signal.call0(&JsValue::NULL).ok();
+                    }
                 }
             })
         };
@@ -606,8 +717,7 @@ impl Worker {
         R: Send + 'static,
     {
         let task = WorkerTask::new(move || box_result(f()));
-        let bytes = self.dispatch(task.into_ptr(), WorkerExecution::Sync).await?;
-        let result_ptr = ptr_from_js(&bytes)?;
+        let result_ptr = self.dispatch(task.into_ptr(), WorkerExecution::Sync, free_result_box::<R>).await?;
         // SAFETY: result_ptr came from box_result::<R> on the worker; R: Send.
         Ok(unsafe { unbox_result::<R>(result_ptr as *mut ()) })
     }
@@ -621,16 +731,20 @@ impl Worker {
         R: Send + 'static,
     {
         let task = AsyncWorkerTask::new(move || async move { box_result(f().await) });
-        let bytes = self.dispatch(task.into_ptr(), WorkerExecution::Async).await?;
-        let result_ptr = ptr_from_js(&bytes)?;
+        let result_ptr = self.dispatch(task.into_ptr(), WorkerExecution::Async, free_result_box::<R>).await?;
         // SAFETY: result_ptr came from box_result::<R> on the worker; R: Send.
         Ok(unsafe { unbox_result::<R>(result_ptr as *mut ()) })
     }
 
     /// Post a `call` frame for `task_ptr`, register a pending entry under a
-    /// fresh id, and await the matching `result` frame (the result-pointer
-    /// bytes, or an `Err` if the task threw or the worker died).
-    async fn dispatch(&self, task_ptr: usize, kind: WorkerExecution) -> Result<JsValue> {
+    /// fresh id, and await its outcome — the result pointer, or an `Err` if the
+    /// task threw or the worker died.
+    ///
+    /// `free_result` is the deallocator for this call's result type. It runs only
+    /// if the awaiting future is dropped while a result is (or becomes) in flight
+    /// (see [`AbandonGuard`]); the normal path returns the pointer and lets
+    /// `run`/`run_blocking` unbox it.
+    async fn dispatch(&self, task_ptr: usize, kind: WorkerExecution, free_result: unsafe fn(usize)) -> Result<usize> {
         if self.dead.get() {
             // The worker will never take the task: reclaim it now.
             // SAFETY: task_ptr came from {WorkerTask,AsyncWorkerTask}::into_ptr
@@ -649,19 +763,28 @@ impl Worker {
             self.next_id.set(n.wrapping_add(1));
             n
         };
-        let (promise, resolve, reject) = new_promise()?;
-        self.pending.borrow_mut().insert(id, Pending { resolve, reject });
+        let slot = Rc::new(RefCell::new(Slot::Waiting));
+        // The signal promise carries no payload — the outcome travels in `slot`.
+        // We only need its resolve fn; it is never rejected.
+        let (signal_promise, signal, _) = new_promise()?;
+        self.pending.borrow_mut().insert(id, Pending { slot: slot.clone(), signal, free_result });
+
+        // Arm before posting: from here until we take the outcome, a dropped
+        // future must reap any result the worker produces.
+        let guard = AbandonGuard { slot: slot.clone(), free_result, armed: Cell::new(true) };
 
         let msg = js_sys::Object::new();
         Reflect::set(&msg, &"type".into(), &"call".into()).map_err(|e| js_err("set type on call", e))?;
-        Reflect::set(&msg, &"id".into(), &JsValue::from_f64(id as f64)).map_err(|e| js_err("set id on call", e))?;
+        Reflect::set(&msg, &"id".into(), &id_to_js(id)).map_err(|e| js_err("set id on call", e))?;
         Reflect::set(&msg, &"kind".into(), &JsValue::from_str(&kind.to_string()))
             .map_err(|e| js_err("set kind on call", e))?;
         Reflect::set(&msg, &"ptr".into(), &ptr_to_js(task_ptr)).map_err(|e| js_err("set ptr on call", e))?;
 
         if let Err(e) = self.inner.post_message(&msg) {
             // Never reached the worker: drop the pending entry and reclaim the
-            // task box (the worker never took ownership).
+            // task box (the worker never took ownership). Nothing was deposited,
+            // so disarm — there is no result to reap.
+            guard.disarm();
             self.pending.borrow_mut().remove(&id);
             // SAFETY: as above; task_ptr not yet handed off.
             unsafe {
@@ -673,7 +796,20 @@ impl Worker {
             return Err(js_err("postMessage(call) failed", e));
         }
 
-        JsFuture::from(promise).await.map_err(|e| js_err("worker task failed", e))
+        // Park until `on_message` deposits the outcome and fires the signal. If
+        // this await is dropped, `guard` reaps; otherwise we disarm and take.
+        // The signal promise resolves with no value and never rejects, so the
+        // result of the await itself is irrelevant — the outcome is in `slot`.
+        JsFuture::from(signal_promise).await.ok();
+        guard.disarm();
+
+        match std::mem::replace(&mut *slot.borrow_mut(), Slot::Done) {
+            Slot::Ok(ptr) => Ok(ptr),
+            Slot::Err(why) => Err(anyhow!("{why}")),
+            // Signalled without an outcome, or signalled twice — neither should
+            // happen; treat as a lost reply rather than fabricating a pointer.
+            Slot::Waiting | Slot::Abandoned | Slot::Done => Err(anyhow!("worxide: worker reply was lost")),
+        }
     }
 
     /// The underlying worker.
@@ -682,6 +818,17 @@ impl Worker {
     /// worker an `OffscreenCanvas`) and attach its own `addEventListener`
     /// side-channels alongside worxide's listener — that traffic does not pass
     /// through worxide's own dispatch.
+    ///
+    /// # Invariant
+    ///
+    /// worxide and your side-channel share one `postMessage` channel, and the
+    /// worker routes on a `type` discriminator. Do **not** post frames whose
+    /// `type` is `"init"` or `"call"`, and do not post an untyped frame carrying
+    /// a `glue_url` field: those are worxide's own protocol. A `call` frame in
+    /// particular hands the worker a raw pointer that it reconstructs into a
+    /// `Box`, so a forged or malformed one is undefined behaviour, not a caught
+    /// error. Keep your messages to your own `type` values and you will never
+    /// collide.
     pub fn raw(&self) -> &WebWorker { &self.inner }
 
     /// Terminate the worker immediately. Idempotent; also runs on drop.
@@ -816,13 +963,15 @@ extern "C" {
 #[wasm_bindgen]
 pub fn __worxide_seed_glue_url(url: String) { GLUE_URL.with(|cell| *cell.borrow_mut() = Some(url)); }
 
-/// Worker thread entry point for sync tasks. Returns the result pointer bytes.
+/// Worker thread entry point for sync tasks. Returns the result pointer bytes,
+/// or `Err` (thrown to JS and caught by worker.js as a per-call error frame) if
+/// the payload is malformed — see [`decode_task_ptr`].
 #[wasm_bindgen]
-pub fn __worxide_worker_entry(ptr_bytes: &[u8]) -> Vec<u8> {
-    let task_ptr = decode_task_ptr(ptr_bytes);
+pub fn __worxide_worker_entry(ptr_bytes: &[u8]) -> Result<Vec<u8>, JsValue> {
+    let task_ptr = decode_task_ptr(ptr_bytes)?;
     // SAFETY: pointer came from WorkerTask::into_ptr on the main thread.
     let task = unsafe { WorkerTask::from_ptr(task_ptr) };
-    (task.run() as usize).to_le_bytes().to_vec()
+    Ok((task.run() as usize).to_le_bytes().to_vec())
 }
 
 /// Worker thread entry point for async tasks. Returns a Promise that
@@ -839,7 +988,12 @@ pub fn __worxide_worker_entry(ptr_bytes: &[u8]) -> Vec<u8> {
 /// futex coordination.
 #[wasm_bindgen]
 pub fn __worxide_worker_entry_async(ptr_bytes: &[u8]) -> js_sys::Promise {
-    let task_ptr = decode_task_ptr(ptr_bytes);
+    let task_ptr = match decode_task_ptr(ptr_bytes) {
+        Ok(p) => p,
+        // Reject (rather than trap) on a malformed payload, for the same
+        // shared-channel reason as the sync entry.
+        Err(e) => return js_sys::Promise::reject(&e),
+    };
     // SAFETY: pointer came from AsyncWorkerTask::into_ptr on the main thread.
     let task = unsafe { AsyncWorkerTask::from_ptr(task_ptr) };
     drive_to_promise(task.run())
