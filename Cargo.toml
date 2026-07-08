@@ -1,7 +1,8 @@
 [package]
 name = "worxide"
-version = "0.0.6"
+version = "0.0.7"
 edition = "2024"
+rust-version = "1.85"
 
 description = "Fast WASM Workers"
 documentation = "https://docs.rs/worxide/latest/worxide/"
