@@ -16,7 +16,7 @@ use {
     js_sys::{Promise, Reflect},
     std::{
         cell::{Cell, RefCell},
-        collections::HashMap,
+        collections::{HashMap, VecDeque},
         fmt::Display,
         future::Future,
         pin::Pin,
@@ -412,9 +412,165 @@ async fn construct_worker(
     }
 }
 
+// ===========================================================================
+// One-shot worker gate
+// ===========================================================================
+//
+// Browsers cap how many workers a page may run concurrently. `spawn!` /
+// `spawn_blocking!` create one worker per call, so a burst of concurrent
+// spawns can exceed that cap and make `Worker` construction fail outright.
+//
+// Every thread (including nested workers) owns a gate limiting how many
+// one-shot workers it may keep alive at once. Calls beyond the limit park in a
+// FIFO; as live workers terminate, permits transfer directly to the oldest
+// parked waiter. Persistent [`Worker`] handles are unaffected: they are
+// long-lived by design and created explicitly.
+
+const DEFAULT_MAX_CONCURRENT_WORKERS: usize = 8;
+
+struct GateWaiter {
+    /// Set before this waiter's signal resolves — ownership of a permit has
+    /// been handed over.
+    granted: Rc<Cell<bool>>,
+    /// Set when the awaiting future is dropped while parked, so the releaser
+    /// skips handing a permit to nobody.
+    cancelled: Rc<Cell<bool>>,
+    /// Resolves the parked future. Carries no payload; possession of the
+    /// permit is signalled through `granted`.
+    signal: js_sys::Function,
+}
+
+struct WorkerGate {
+    max: usize,
+    active: usize,
+    waiters: VecDeque<GateWaiter>,
+}
+
+impl WorkerGate {
+    const fn new() -> Self {
+        Self { max: DEFAULT_MAX_CONCURRENT_WORKERS, active: 0, waiters: VecDeque::new() }
+    }
+
+    fn try_acquire(&mut self) -> bool {
+        if self.active < self.max {
+            self.active += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn release(&mut self) {
+        debug_assert!(self.active > 0);
+        self.active = self.active.saturating_sub(1);
+
+        // Hand the freed slot straight to the oldest live waiter. The permit
+        // transfers without returning to `active`, so no third caller can
+        // jump the queue between release and handoff.
+        while let Some(w) = self.waiters.pop_front() {
+            if w.cancelled.get() {
+                continue;
+            }
+            w.granted.set(true);
+            w.signal.call0(&JsValue::NULL).ok();
+            return;
+        }
+    }
+}
+
+thread_local! {
+    static WORKER_GATE: RefCell<WorkerGate> = const { RefCell::new(WorkerGate::new()) };
+}
+
+/// Set the maximum number of concurrently-alive one-shot workers for the
+/// calling thread (main thread and each nested worker have their own gate).
+/// Minimum value is 1. Calls beyond the limit queue until earlier workers
+/// terminate.
+pub fn set_max_concurrent_workers(max: usize) {
+    WORKER_GATE.with(|g| g.borrow_mut().max = max.max(1));
+}
+
+/// The current one-shot worker concurrency cap for the calling thread.
+pub fn max_concurrent_workers() -> usize { WORKER_GATE.with(|g| g.borrow().max) }
+
+/// Held for the lifetime of one one-shot worker. Dropping releases the slot —
+/// covering error returns, early exits, and cancellation of the awaiting
+/// future alike.
+struct WorkerPermit;
+
+impl Drop for WorkerPermit {
+    fn drop(&mut self) {
+        WORKER_GATE.with(|g| g.borrow_mut().release());
+    }
+}
+
+/// Parked-gate wait. Awaiting the JS promise resolves only when a permit has
+/// been handed to *this* waiter (`granted` set first); dropping mid-wait marks
+/// the queue entry cancelled so a later handoff skips it instead of leaking
+/// the slot to a dead awaiter.
+struct GateWait {
+    fut: JsFuture,
+    granted: Rc<Cell<bool>>,
+    cancelled: Rc<Cell<bool>>,
+}
+
+impl Future for GateWait {
+    type Output = ();
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<()> {
+        let granted = self.granted.clone();
+
+        match Pin::new(&mut self.fut).poll(cx) {
+            Poll::Ready(_) => {
+                debug_assert!(granted.get(), "gate signal resolved without a handed-off permit");
+                Poll::Ready(())
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl Drop for GateWait {
+    fn drop(&mut self) { self.cancelled.set(true); }
+}
+
+async fn acquire_worker_permit() -> WorkerPermit {
+    let granted = Rc::new(Cell::new(false));
+    let cancelled = Rc::new(Cell::new(false));
+
+    // Fast path and queueing happen in one synchronous block: gate state can
+    // never be observed mid-mutation on a single-threaded event loop.
+    let promise = WORKER_GATE.with(|g| {
+        let mut g = g.borrow_mut();
+
+        if g.try_acquire() {
+            granted.set(true);
+            None
+        } else {
+            let (promise, resolve, _) =
+                new_promise().expect("worxide: Promise executor did not capture resolve");
+            g.waiters.push_back(GateWaiter { granted: granted.clone(), cancelled: cancelled.clone(), signal: resolve });
+            Some(promise)
+        }
+    });
+
+    if let Some(promise) = promise {
+        GateWait { fut: JsFuture::from(promise), granted: granted.clone(), cancelled }.await;
+        debug_assert!(granted.get());
+    }
+
+    WorkerPermit
+}
+
 /// Spawn a one-shot worker, post the task pointer, await the reply, then
 /// terminate the worker.
+///
+/// Concurrent spawns are gated per thread: once the worker cap is reached,
+/// further calls park in FIFO order until earlier workers finish, so bursts
+/// never exceed the browser's worker limit.
 async fn run_inner(task_ptr: usize, kind: WorkerExecution, crate_name: &str) -> Result<usize> {
+    let _permit = acquire_worker_permit().await;
+
     let glue_url = cached_glue_url(crate_name);
     let worker_url = worker_url()?;
     let module = wasm_bindgen::module();

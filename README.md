@@ -194,6 +194,27 @@ fn foo() {
 
 There is an exported function offered if you wish to detect whether your code is running on a worker or not.
 
+### Concurrency gating: `set_max_concurrent_workers()`
+
+Each `spawn!` / `spawn_blocking!` call creates a one-shot worker, and browsers
+cap how many workers a page may run. A burst of concurrent spawns (for example,
+many simultaneous network requests) could previously exceed that cap and make
+worker construction fail.
+
+`worxide` now gates one-shot workers per thread: at most N are alive at once
+(default **8**), and calls beyond the cap park in FIFO order until earlier
+workers terminate. Permits transfer directly from a terminating worker to the
+oldest parked caller, and cancellation is safe — dropping an awaiting future
+releases or forfeits its slot cleanly.
+
+```rust
+// Raise the cap for this thread (main thread and each nested worker have their own gate).
+worxide::set_max_concurrent_workers(16);
+let current = worxide::max_concurrent_workers();
+```
+
+Persistent `Worker` handles are unaffected; they are long-lived by design.
+
 ## Requirements
 
 - Nightly Rust with `rust-src`
