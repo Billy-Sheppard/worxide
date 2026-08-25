@@ -357,27 +357,34 @@ async fn construct_worker(
 
     let worker = WebWorker::new_with_options(worker_url, &opts).map_err(|e| js_err("Worker construction failed", e))?;
 
+    // Note: `Closure::once_into_js` is deliverately avoided here as its owning
+    // `ScopedClosure` can be double-freed if not called, which corrupts the heap.
+    // An owned `FnMut` closure released with `forget()` has exactly one path
+    // to destruction, so it is safe whether the callback fires or not.
+    // See: `can't access property "_wbg_cb_unref", arg0 is null`
     let setup = (|| -> Result<Promise> {
         let (promise, resolve, reject) = new_promise()?;
 
         let on_message = {
             let resolve = resolve.clone();
-            Closure::once_into_js(move |evt: MessageEvent| {
+            Closure::<dyn FnMut(MessageEvent)>::new(move |evt: MessageEvent| {
                 // The reply is a Uint8Array of little-endian pointer bytes.
-                // Forward it verbatim; `run_inner` validates the shape via
-                // `ptr_from_js`.
+                // Forward it verbatim; run_inner decodes and validates it via
+                // ptr_from_js (a non-Uint8Array reply surfaces as an Err there).
                 resolve.call1(&JsValue::NULL, &evt.data()).unwrap();
             })
         };
-        worker.set_onmessage(Some(on_message.unchecked_ref()));
+        worker.set_onmessage(Some(on_message.as_ref().unchecked_ref()));
+        on_message.forget();
 
         let on_error = {
             let reject = reject.clone();
-            Closure::once_into_js(move |evt: JsValue| {
+            Closure::<dyn FnMut(JsValue)>::new(move |evt: JsValue| {
                 reject.call1(&JsValue::NULL, &evt).unwrap();
             })
         };
-        worker.set_onerror(Some(on_error.unchecked_ref()));
+        worker.set_onerror(Some(on_error.as_ref().unchecked_ref()));
+        on_error.forget();
 
         let msg = js_sys::Object::new();
 
@@ -999,6 +1006,10 @@ impl DriveState {
         }
     }
 
+    /// Schedule a re-poll on the microtask queue (idempotent per wake).
+    ///
+    /// Avodiding using `Closure::once_into_js` as it can double-free,
+    /// which corrupts the heap. See note in `construct_worker`
     fn schedule(self: &Rc<Self>) {
         if *self.scheduled.borrow() {
             return;
@@ -1007,8 +1018,9 @@ impl DriveState {
         *self.scheduled.borrow_mut() = true;
 
         let this = self.clone();
-        let cb = Closure::once_into_js(move || this.poll());
-        queue_microtask(&cb);
+        let cb = Closure::<dyn FnMut()>::new(move || this.poll());
+        queue_microtask(cb.as_ref());
+        cb.forget();
     }
 
     /// Build a `Waker` from this `Rc<DriveState>` via a hand-rolled vtable.
