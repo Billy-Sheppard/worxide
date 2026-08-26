@@ -5,7 +5,7 @@
 #[doc(hidden)]
 pub mod private;
 
-pub use private::Worker;
+pub use private::{Worker, max_concurrent_workers, set_max_concurrent_workers};
 
 /// Detects if the current thread is a Web Worker
 ///
@@ -31,6 +31,12 @@ pub fn is_worker() -> bool {
 /// The worker runs `func(args...)` on its own thread; the call site gets back a future of `anyhow::Result<R>`,
 /// with `R` inferred from `func`'s return type. Use this for CPU-bound work that would otherwise block the caller.
 ///
+/// Concurrent spawns are gated: at most [`max_concurrent_workers`] one-shot
+/// workers (default 8, per thread) are alive at once. Calls beyond the cap
+/// park in FIFO order until earlier workers terminate, so bursts of spawns
+/// cannot exceed the browser's worker limit and fail construction. Tune the
+/// cap with [`set_max_concurrent_workers`].
+///
 /// ```ignore
 /// fn crunch(n: u32) -> u64 { (n as u64) * 2 }
 /// let result = worxide::spawn_blocking!(crunch, 42).await?;
@@ -49,6 +55,11 @@ macro_rules! spawn_blocking {
 ///
 /// Like [`spawn_blocking!`], but for `async fn` / future-returning functions.
 /// The worker drives the future to completion on its own event loop (a JS Promise).
+///
+/// Subject to the same per-thread concurrency gate as [`spawn_blocking!`] —
+/// see its docs. This matters most here: bursts of concurrent network calls
+/// through `spawn!` are exactly the pattern that used to exhaust the browser's
+/// worker pool.
 ///
 /// ```ignore
 /// async fn get_image(url: &str) -> anyhow::Result<String> { reqwest::get(url).text().await? }
