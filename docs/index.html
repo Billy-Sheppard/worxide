@@ -11,12 +11,46 @@
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bulma@1.0.4/css/bulma.min.css">
 
   <style>
-    html,
+    html {
+      width: 100%;
+      min-height: 100%;
+      overflow-y: auto;
+      overflow-x: hidden;
+    }
+
     body {
-      width: 100svw;
-      height: 100svh;
-      overflow: hidden;
+      width: 100%;
+      min-height: 100vh;
+      height: auto;
       margin: 0;
+      overflow: visible;
+    }
+
+    body>.section {
+      min-height: 100vh;
+      height: auto;
+      overflow: visible;
+    }
+
+    .benchmark-grid {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      align-items: start;
+      gap: 1rem;
+      margin-bottom: 2rem;
+    }
+
+    .benchmark-grid>.box {
+      min-width: 0;
+      margin: 0;
+    }
+
+    .benchmark-grid pre {
+      margin-top: 1rem;
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+      font-size: 0.85rem;
+      line-height: 1.6;
     }
 
     .fading-text {
@@ -32,6 +66,12 @@
         color: #808080;
       }
     }
+
+    @media (max-width: 1000px) {
+      .benchmark-grid {
+        grid-template-columns: 1fr;
+      }
+    }
   </style>
 
   <script>
@@ -45,14 +85,15 @@
   </script>
 </head>
 
-<body></body>
+<body>
+  <script type="module">
+    import init, { run_app } from './worxide_example.js';
 
-<script type="module">
-  import init, { run_app } from './worxide_example.js';
-  if (self.crossOriginIsolated) {
-    await init();
-    await run_app();
-  }
-</script>
+    if (self.crossOriginIsolated) {
+      await init();
+      await run_app();
+    }
+  </script>
+</body>
 
 </html>

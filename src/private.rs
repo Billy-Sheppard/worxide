@@ -34,7 +34,7 @@ use {
 
 /// Worker bootstrap source, embedded at compile time. Turned into a fresh Blob
 /// URL for each spawned worker so consumers do not need to serve a worker file.
-const WORKER_JS: &str = include_str!("worker.js");
+pub(crate) const WORKER_JS: &str = include_str!("worker.js");
 
 /// Width of a pointer on the target, in bytes.
 ///
@@ -123,7 +123,7 @@ fn cached_glue_url(crate_name: &str) -> String {
 /// captured `CARGO_PKG_NAME`. It uses an already-cached URL if one exists, or
 /// the consumer-set `globalThis.app_js_path`; otherwise the caller must use
 /// [`Worker::with_glue`].
-fn glue_url_via_app_path() -> Result<String> {
+pub(crate) fn glue_url_via_app_path() -> Result<String> {
     if let Some(url) = GLUE_URL.with(|c| c.borrow().clone()) {
         return Ok(url);
     }
@@ -138,7 +138,7 @@ fn glue_url_via_app_path() -> Result<String> {
 }
 
 /// Resolve an explicit glue path/URL against the document base and cache it.
-fn glue_url_explicit(path: &str) -> String {
+pub(crate) fn glue_url_explicit(path: &str) -> String {
     let url = worxide_glue_url_from_path(path);
     GLUE_URL.with(|c| *c.borrow_mut() = Some(url.clone()));
     url
@@ -447,9 +447,7 @@ struct WorkerGate {
 }
 
 impl WorkerGate {
-    const fn new() -> Self {
-        Self { max: DEFAULT_MAX_CONCURRENT_WORKERS, active: 0, waiters: VecDeque::new() }
-    }
+    const fn new() -> Self { Self { max: DEFAULT_MAX_CONCURRENT_WORKERS, active: 0, waiters: VecDeque::new() } }
 
     fn try_acquire(&mut self) -> bool {
         if self.active < self.max {
@@ -462,19 +460,21 @@ impl WorkerGate {
 
     fn release(&mut self) {
         debug_assert!(self.active > 0);
-        self.active = self.active.saturating_sub(1);
 
         // Hand the freed slot straight to the oldest live waiter. The permit
         // transfers without returning to `active`, so no third caller can
         // jump the queue between release and handoff.
-        while let Some(w) = self.waiters.pop_front() {
-            if w.cancelled.get() {
+        while let Some(waiter) = self.waiters.pop_front() {
+            if waiter.cancelled.get() {
                 continue;
             }
-            w.granted.set(true);
-            w.signal.call0(&JsValue::NULL).ok();
-            return;
+            waiter.granted.set(true);
+            if waiter.signal.call0(&JsValue::NULL).is_ok() {
+                return;
+            }
+            waiter.granted.set(false);
         }
+        self.active = self.active.saturating_sub(1);
     }
 }
 
@@ -486,9 +486,7 @@ thread_local! {
 /// calling thread (main thread and each nested worker have their own gate).
 /// Minimum value is 1. Calls beyond the limit queue until earlier workers
 /// terminate.
-pub fn set_max_concurrent_workers(max: usize) {
-    WORKER_GATE.with(|g| g.borrow_mut().max = max.max(1));
-}
+pub fn set_max_concurrent_workers(max: usize) { WORKER_GATE.with(|g| g.borrow_mut().max = max.max(1)); }
 
 /// The current one-shot worker concurrency cap for the calling thread.
 pub fn max_concurrent_workers() -> usize { WORKER_GATE.with(|g| g.borrow().max) }
@@ -499,9 +497,7 @@ pub fn max_concurrent_workers() -> usize { WORKER_GATE.with(|g| g.borrow().max) 
 struct WorkerPermit;
 
 impl Drop for WorkerPermit {
-    fn drop(&mut self) {
-        WORKER_GATE.with(|g| g.borrow_mut().release());
-    }
+    fn drop(&mut self) { WORKER_GATE.with(|g| g.borrow_mut().release()); }
 }
 
 /// Parked-gate wait. Awaiting the JS promise resolves only when a permit has
@@ -547,8 +543,7 @@ async fn acquire_worker_permit() -> WorkerPermit {
             granted.set(true);
             None
         } else {
-            let (promise, resolve, _) =
-                new_promise().expect("worxide: Promise executor did not capture resolve");
+            let (promise, resolve, _) = new_promise().expect("worxide: Promise executor did not capture resolve");
             g.waiters.push_back(GateWaiter { granted: granted.clone(), cancelled: cancelled.clone(), signal: resolve });
             Some(promise)
         }

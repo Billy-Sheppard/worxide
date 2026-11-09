@@ -2,10 +2,22 @@
 
 #![doc = include_str!("../README.md")]
 
+mod builder;
+mod isolated;
 #[doc(hidden)]
 pub mod private;
 
-pub use private::{Worker, max_concurrent_workers, set_max_concurrent_workers};
+pub use {
+    builder::{IsolatedWorkerBuilder, WorkerBuilder},
+    private::{Worker, max_concurrent_workers, set_max_concurrent_workers},
+};
+
+#[cfg(feature = "rayon")]
+mod rayon_impl;
+#[cfg(feature = "rayon")]
+pub use rayon;
+#[cfg(feature = "rayon")]
+pub use rayon_impl::*;
 
 /// Detects if the current thread is a Web Worker
 ///

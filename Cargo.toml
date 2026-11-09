@@ -1,6 +1,6 @@
 [package]
 name = "worxide"
-version = "0.0.8"
+version = "0.0.9"
 edition = "2024"
 rust-version = "1.85"
 
@@ -22,16 +22,24 @@ web-sys = { workspace = true }
 opt-level = 3
 lto = true
 
+[features]
+default = []
+rayon = ["dep:rayon"]
+
+[dependencies.rayon]
+version = "1.11"
+optional = true
+
 [workspace]
 resolver = "3"
 members = ["worxide-example"]
 
 [workspace.dependencies]
 anyhow = "1.0.104"
-js-sys = "0.3.104"
-wasm-bindgen = "0.2.127"
-wasm-bindgen-futures = "0.4.77"
-web-sys = { version = "0.3.104", features = [
+js-sys = "0.3.107"
+wasm-bindgen = "0.2.130"
+wasm-bindgen-futures = "0.4.80"
+web-sys = { version = "0.3.107", features = [
     "Blob",
     "BlobPropertyBag",
     "EventTarget",
@@ -41,6 +49,7 @@ web-sys = { version = "0.3.104", features = [
     "Url",
     "Worker",
     "WorkerGlobalScope",
+    "WorkerNavigator",
     "WorkerOptions",
     "WorkerType",
 ] }

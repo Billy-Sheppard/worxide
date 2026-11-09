@@ -10,6 +10,7 @@ use {
     html_macros::*,
     std::{collections::HashSet, future::Future, ops::*, pin::Pin, sync::Arc},
     wasm_bindgen::{self, JsCast, prelude::*},
+    worxide::{rayon, rayon::iter::*},
 };
 
 fn fibonacci(n: u64) -> u64 {
@@ -238,9 +239,12 @@ fn worker_names() -> HashSet<&'static str> {
         "William",
     ])
 }
-
 #[wasm_bindgen]
 pub async fn run_app() -> Result<(), JsValue> {
+    if worxide::is_worker() {
+        return Ok(());
+    }
+
     let pool = Mutable::new(build_pool());
     let workers: MutableVec<Arc<Worker>> = MutableVec::new();
 
@@ -315,6 +319,8 @@ pub async fn run_app() -> Result<(), JsValue> {
     let dom = html_div()
         .class(["section"])
         .child(header)
+        .child(html_hr().into_dom())
+        .child(html_h2().class("title").text("Off-thread Examples").into_dom())
         .child(
             html_div()
                 .class(["columns"])
@@ -475,6 +481,9 @@ pub async fn run_app() -> Result<(), JsValue> {
                 )
                 .into_dom(),
         )
+        .child(html_hr().into_dom())
+        .child(html_h2().class("title").text("Other Uses").into_dom())
+        .child(other_examples())
         .into_dom();
 
     dominator::append_dom(&dominator::body(), dom);
@@ -554,3 +563,371 @@ fn start_pressure_observer(pressure: Mutable<Option<String>>) {
 }
 
 fn now_ms() -> f64 { web_sys::window().and_then(|w| w.performance()).map(|p| p.now()).unwrap_or(0.0) }
+
+thread_local! {
+    // Retain the listener for the lifetime of the worker.
+    #[allow(clippy::type_complexity)]static EXAMPLE_LISTENER:
+        std::cell::RefCell<Option<Closure<dyn FnMut(web_sys::MessageEvent)>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+thread_local! {
+    static EXAMPLE_RAYON_POOL:
+        std::cell::RefCell<Option<rayon::ThreadPool>> =
+        const { std::cell::RefCell::new(None) };
+
+    // Keep the coordinator alive while its pool exists.
+    static EXAMPLE_RAYON_COORDINATOR:
+        std::cell::RefCell<Option<std::rc::Rc<worxide::Worker>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Runs automatically when the module is instantiated in a worker.
+///
+/// This listener belongs to the example application, not worxide.
+#[wasm_bindgen(start)]
+pub fn initialize_worker_example() {
+    if !worxide::is_worker() {
+        return;
+    }
+
+    let scope: web_sys::DedicatedWorkerGlobalScope = js_sys::global().unchecked_into();
+
+    let reply_scope = scope.clone();
+
+    let listener = Closure::<dyn FnMut(web_sys::MessageEvent)>::new(move |event: web_sys::MessageEvent| {
+        let Some(message) = event.data().as_string() else {
+            return;
+        };
+
+        let Some(index) = message.strip_prefix("worxide-example:calculate:") else {
+            return;
+        };
+
+        let result = (|| -> anyhow::Result<String> {
+            let index = index.parse::<usize>()?;
+
+            let &(name, function, input, calls) =
+                COMPARISONS.get(index).ok_or_else(|| anyhow::anyhow!("Unknown comparison"))?;
+
+            let started = js_sys::Date::now();
+            let checksum = run_batch(function, input, calls);
+            let elapsed_ms = js_sys::Date::now() - started;
+
+            Ok(format!("Completed\nWorkload: {calls} × {name}({input})\nCompute: {elapsed_ms:.2} ms\nChecksum: {checksum}"))
+        })();
+
+        let reply = match result {
+            Ok(message) => format!("worxide-example:ok:{message}"),
+            Err(error) => format!("worxide-example:error:{error:#}"),
+        };
+
+        let _ = reply_scope.post_message(&reply.into());
+    });
+
+    scope
+        .add_event_listener_with_callback("message", listener.as_ref().unchecked_ref())
+        .expect("Unable to install example listener");
+
+    EXAMPLE_LISTENER.with(|slot| {
+        *slot.borrow_mut() = Some(listener);
+    });
+}
+
+fn example_glue_path() -> String {
+    // Same Cargo filename convention used by the existing spawn macros.
+    // Change this if your build uses a custom wasm-bindgen output name.
+    format!("{}.js", env!("CARGO_PKG_NAME").replace('-', "_"))
+}
+
+async fn persistent_worker_example(index: usize) -> anyhow::Result<String> {
+    let &(name, function, input, calls) = COMPARISONS.get(index).ok_or_else(|| anyhow::anyhow!("Unknown comparison"))?;
+
+    let started = js_sys::Date::now();
+
+    let worker = worxide::WorkerBuilder::default().glue_url(example_glue_path()).spawn().await?;
+
+    let startup_ms = js_sys::Date::now() - started;
+
+    let (first_checksum, first_ms) = worker
+        .run_blocking(move || {
+            let started = js_sys::Date::now();
+            let checksum = run_batch(function, input, calls);
+
+            (checksum, js_sys::Date::now() - started)
+        })
+        .await?;
+
+    let (second_checksum, second_ms) = worker
+        .run_blocking(move || {
+            let started = js_sys::Date::now();
+            let checksum = run_batch(function, input, calls);
+
+            (checksum, js_sys::Date::now() - started)
+        })
+        .await?;
+
+    anyhow::ensure!(first_checksum == second_checksum, "Repeated calls produced different checksums");
+
+    Ok(format!(
+        "PASS: repeated checksums match\nWorkload per batch: {calls} × {name}({input})\nWorker startup: {startup_ms:.2} \
+         ms\nFirst batch: {first_ms:.2} ms\nSecond batch: {second_ms:.2} ms\nChecksum per batch: {first_checksum}\nBoth \
+         batches used the same worker.",
+    ))
+}
+
+async fn isolated_worker_example(index: usize) -> anyhow::Result<String> {
+    anyhow::ensure!(index < COMPARISONS.len(), "Unknown comparison",);
+
+    let started = js_sys::Date::now();
+
+    let worker = worxide::WorkerBuilder::default().glue_url(example_glue_path()).isolated().max_256mib().spawn().await?;
+
+    let startup_ms = js_sys::Date::now() - started;
+
+    let mut functions = None;
+
+    let promise = js_sys::Promise::new(&mut |resolve, reject| {
+        functions = Some((resolve, reject));
+    });
+
+    let (resolve, reject) = functions.expect("Promise executor must run synchronously");
+
+    let message_reject = reject.clone();
+
+    let on_message = Closure::<dyn FnMut(web_sys::MessageEvent)>::new(move |event: web_sys::MessageEvent| {
+        let Some(reply) = event.data().as_string() else {
+            return;
+        };
+
+        if let Some(result) = reply.strip_prefix("worxide-example:ok:") {
+            resolve.call1(&JsValue::NULL, &result.into()).ok();
+        } else if let Some(error) = reply.strip_prefix("worxide-example:error:") {
+            message_reject.call1(&JsValue::NULL, &error.into()).ok();
+        }
+    });
+
+    let on_error = Closure::<dyn FnMut(JsValue)>::new(move |error: JsValue| {
+        reject.call1(&JsValue::NULL, &error).ok();
+    });
+
+    worker.worker_handle().set_onmessage(Some(on_message.as_ref().unchecked_ref()));
+
+    worker.worker_handle().set_onerror(Some(on_error.as_ref().unchecked_ref()));
+
+    let started = js_sys::Date::now();
+
+    let result = async {
+        worker.worker_handle().post_message(&format!("worxide-example:calculate:{index}").into())?;
+
+        wasm_bindgen_futures::JsFuture::from(promise).await
+    }
+    .await;
+
+    let request_ms = js_sys::Date::now() - started;
+
+    worker.worker_handle().set_onmessage(None);
+    worker.worker_handle().set_onerror(None);
+    worker.terminate();
+
+    let reply = result.map_err(|error| anyhow::anyhow!("{}", error.as_string().unwrap_or_else(|| format!("{error:?}")),))?;
+
+    Ok(format!(
+        "{}\nWorker startup: {startup_ms:.2} ms\nRequest round trip: {request_ms:.2} ms\nMemory ceiling: 256 MiB\nWorker \
+         terminated.",
+        reply.as_string().unwrap_or_default(),
+    ))
+}
+
+async fn rayon_worker_example(index: usize) -> anyhow::Result<String> {
+    let &(name, function, input, calls) = COMPARISONS.get(index).ok_or_else(|| anyhow::anyhow!("Unknown comparison"))?;
+
+    let existing = EXAMPLE_RAYON_COORDINATOR.with(|slot| slot.borrow().clone());
+
+    let coordinator = match existing {
+        Some(worker) => worker,
+        None => {
+            let worker = std::rc::Rc::new(worxide::WorkerBuilder::default().glue_url(example_glue_path()).spawn().await?);
+
+            EXAMPLE_RAYON_COORDINATOR.with(|slot| {
+                *slot.borrow_mut() = Some(worker.clone());
+            });
+
+            worker
+        }
+    };
+
+    coordinator
+        .run(|| async {
+            if EXAMPLE_RAYON_POOL.with(|slot| slot.borrow().is_some()) {
+                return Ok::<(), anyhow::Error>(());
+            }
+
+            let pool = worxide::RayonPoolBuilder::new().spawn().await?;
+
+            EXAMPLE_RAYON_POOL.with(|slot| {
+                *slot.borrow_mut() = Some(pool);
+            });
+
+            Ok(())
+        })
+        .await??;
+
+    let (sequential, parallel, sequential_ms, parallel_ms, threads) = coordinator
+        .run_blocking(move || {
+            EXAMPLE_RAYON_POOL.with(|slot| {
+                let slot = slot.borrow();
+
+                let pool = slot.as_ref().ok_or_else(|| anyhow::anyhow!("Rayon pool is not initialized"))?;
+
+                let started = js_sys::Date::now();
+
+                let sequential = run_batch(function, input, calls);
+
+                let sequential_ms = js_sys::Date::now() - started;
+                let started = js_sys::Date::now();
+
+                let parallel = pool.install(|| {
+                    (0..calls)
+                        .into_par_iter()
+                        .map(|_| {
+                            let result = function(std::hint::black_box(input));
+
+                            std::hint::black_box(result)
+                        })
+                        .reduce(|| 0u64, |left, right| left.wrapping_add(right))
+                });
+
+                let parallel_ms = js_sys::Date::now() - started;
+
+                Ok::<_, anyhow::Error>((sequential, parallel, sequential_ms, parallel_ms, pool.current_num_threads()))
+            })
+        })
+        .await??;
+
+    anyhow::ensure!(sequential == parallel, "Sequential and parallel checksums differ",);
+
+    let ratio = if parallel_ms > 0.0 { format!("{:.2}×", sequential_ms / parallel_ms) } else { "Not measurable".into() };
+
+    Ok(format!(
+        "PASS: checksums match\nWorkload: {calls} × {name}({input})\nRayon threads: {threads}\nSequential: \
+         {sequential_ms:.2} ms\nParallel: {parallel_ms:.2} ms\nSequential/parallel time: {ratio}\nChecksum: \
+         {parallel}\nCoordinator and pool retained.",
+    ))
+}
+
+fn other_examples() -> dominator::Dom {
+    let running = Mutable::new(false);
+
+    #[allow(clippy::type_complexity)]
+    let groups: [(&str, fn(usize) -> RunFuture); 3] = [
+        ("Persistent shared workers", |index| {
+            Box::pin(async move { persistent_worker_example(index).await.map_err(|error| format!("{error:#}")) })
+        }),
+        ("Independent memory", |index| {
+            Box::pin(async move { isolated_worker_example(index).await.map_err(|error| format!("{error:#}")) })
+        }),
+        ("Rayon: sequential versus parallel", |index| {
+            Box::pin(async move { rayon_worker_example(index).await.map_err(|error| format!("{error:#}")) })
+        }),
+    ];
+
+    html_div()
+        .children([
+            html_p()
+                .style("margin-bottom", "1rem")
+                .text(
+                    "Each category runs the same existing utilities. Timed computation excludes worker and pool startup. \
+                     Run without concurrent jobs for cleaner comparisons.",
+                )
+                .into_dom(),
+            html_div()
+                .children(groups.into_iter().map(|(title, run)| {
+                    html_div()
+                        .children([
+                            html_h3().class("subtitle").text(title).into_dom(),
+                            html_div()
+                                .class(["benchmark-grid"])
+                                .children(COMPARISONS.iter().enumerate().map(|(index, &(name, _, input, calls))| {
+                                    example_button(
+                                        name,
+                                        format!("{calls} calls to {name}({input})",),
+                                        index,
+                                        run,
+                                        running.clone(),
+                                    )
+                                }))
+                                .into_dom(),
+                        ])
+                        .into_dom()
+                }))
+                .into_dom(),
+        ])
+        .into_dom()
+}
+
+fn example_button(
+    title: &'static str,
+    description: String,
+    index: usize,
+    run: fn(usize) -> RunFuture,
+    running: Mutable<bool>,
+) -> dominator::Dom {
+    let output = Mutable::new("Not run.".to_string());
+    let click_running = running.clone();
+    let click_output = output.clone();
+
+    html_div()
+        .class("box")
+        .children([
+            html_h3().class("subtitle").text(title).into_dom(),
+            html_p().style("margin-bottom", "1rem").text(&description).into_dom(),
+            html_button()
+                .class(["button", "is-link"])
+                .prop_signal("disabled", running.signal())
+                .text("Run")
+                .event(move |_: events::Click| {
+                    if click_running.replace(true) {
+                        return;
+                    }
+
+                    let running = click_running.clone();
+                    let output = click_output.clone();
+
+                    output.set("Running…".into());
+
+                    wasm_bindgen_futures::spawn_local(async move {
+                        output.set(match run(index).await {
+                            Ok(message) => message,
+                            Err(error) => format!("Failed: {error}"),
+                        });
+
+                        running.set(false);
+                    });
+                })
+                .into_dom(),
+            html_pre()
+                .style("margin-top", "1rem")
+                .style("white-space", "pre-wrap")
+                .text_signal(output.signal_cloned())
+                .into_dom(),
+        ])
+        .into_dom()
+}
+
+type Comparison = (&'static str, fn(u64) -> u64, u64, usize);
+
+// Each configuration runs exactly the same calls in every execution mode.
+//
+// Enough independent calls are provided for the Rayon pool to distribute.
+// Adjust inputs or call counts here to change the workload.
+const COMPARISONS: [Comparison; 3] =
+    [("fibonacci", fibonacci, 38, 16), ("collatz", collatz, 500_000, 32), ("prime_count", prime_count, 250_000, 32)];
+
+fn run_batch(function: fn(u64) -> u64, input: u64, calls: usize) -> u64 {
+    (0..calls).fold(0u64, |checksum, _| {
+        let result = function(std::hint::black_box(input));
+
+        checksum.wrapping_add(std::hint::black_box(result))
+    })
+}

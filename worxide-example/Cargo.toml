@@ -10,7 +10,7 @@ crate-type = ["cdylib"]
 anyhow = { workspace = true }
 dominator = "0.5.38"
 futures-signals = "0.3.34"
-gloo = "0.12.0"
+# gloo = "0.12.0"
 js-sys = { workspace = true }
 # serde = "1.0.228"
 serde_json = "1.0.150"
@@ -19,6 +19,8 @@ wasm-bindgen = { workspace = true }
 wasm-bindgen-futures = { workspace = true }
 web-sys = { workspace = true, features = [
     "console",
+    "DedicatedWorkerGlobalScope",
+    "EventTarget",
     "HtmlAnchorElement",
     "HtmlButtonElement",
     "HtmlCanvasElement",
@@ -39,7 +41,10 @@ web-sys = { workspace = true, features = [
     "HtmlTableElement",
     "HtmlTableRowElement",
     "HtmlTableSectionElement",
+    "MessageEvent",
     "Performance",
     "Window",
+    "Worker",
+    "WorkerGlobalScope",
 ] }
-worxide = { path = "../" }
+worxide = { path = "../", features = ["rayon"] }
